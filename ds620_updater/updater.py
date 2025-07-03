@@ -10,7 +10,10 @@ import time
 import argparse
 import logging
 import subprocess
+import signal
+import atexit
 from pathlib import Path
+from datetime import datetime
 
 try:
     import usb.core
@@ -40,18 +43,92 @@ WAIT_UPDATE = 3.0
 PRG_UPDATE_WAIT = 5.0
 
 class DS620Updater:
-    def __init__(self, firmware_path, cwd_dir):
+    def __init__(self, firmware_path, cwd_dir, log_file=None):
         self.firmware_path = Path(firmware_path)
         self.cwd_dir = Path(cwd_dir)
         self.device = None
         self.ep_out = None
         self.ep_in = None
+        self.cups_was_running = False
+        self.update_in_progress = False
+        self.start_time = datetime.now()
         
         # Setup logging
-        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+        self.setup_logging(log_file)
+        
+        # Setup signal handlers
+        self.setup_signal_handlers()
+        
+    def setup_logging(self, log_file):
+        """Setup logging to both console and file"""
         self.logger = logging.getLogger(__name__)
-        # Inherit parent logger level (for --debug flag)
-        self.logger.setLevel(logging.getLogger().level)
+        self.logger.setLevel(logging.DEBUG if log_file else logging.INFO)
+        
+        # Console handler
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.getLogger().level)
+        console_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        console_handler.setFormatter(console_formatter)
+        self.logger.addHandler(console_handler)
+        
+        # File handler if requested
+        if log_file:
+            file_handler = logging.FileHandler(log_file)
+            file_handler.setLevel(logging.DEBUG)
+            file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(funcName)s - %(message)s')
+            file_handler.setFormatter(file_formatter)
+            self.logger.addHandler(file_handler)
+            self.logger.info(f"Logging to file: {log_file}")
+            
+    def setup_signal_handlers(self):
+        """Setup signal handlers for clean shutdown"""
+        signal.signal(signal.SIGINT, self.signal_handler)
+        signal.signal(signal.SIGTERM, self.signal_handler)
+        atexit.register(self.cleanup)
+        
+    def signal_handler(self, signum, frame):
+        """Handle Ctrl+C and termination signals"""
+        self.logger.warning("\n\nReceived interrupt signal!")
+        if self.update_in_progress:
+            self.logger.error("WARNING: Update in progress! Interrupting now may damage the printer!")
+            self.logger.error("Press Ctrl+C again within 5 seconds to force quit...")
+            
+            # Give user a chance to reconsider
+            signal.signal(signal.SIGINT, self.force_quit)
+            time.sleep(5)
+            signal.signal(signal.SIGINT, self.signal_handler)
+        else:
+            self.cleanup()
+            sys.exit(1)
+            
+    def force_quit(self, signum, frame):
+        """Force quit on second Ctrl+C"""
+        self.logger.error("FORCE QUIT - Update interrupted!")
+        self.cleanup()
+        sys.exit(1)
+        
+    def cleanup(self):
+        """Clean up resources and restore CUPS if needed"""
+        self.logger.info("Cleaning up...")
+        
+        # Release USB resources
+        if self.device:
+            try:
+                usb.util.dispose_resources(self.device)
+                self.logger.debug("USB resources released")
+            except:
+                pass
+                
+        # Restart CUPS if we stopped it
+        if self.cups_was_running:
+            self.logger.info("Restarting CUPS service...")
+            try:
+                subprocess.run(['sudo', 'systemctl', 'start', 'cups'], 
+                             capture_output=True, check=True)
+                self.logger.info("CUPS service restarted")
+            except Exception as e:
+                self.logger.error(f"Failed to restart CUPS: {e}")
+                self.logger.error("Please run: sudo systemctl start cups")
         
     def check_cups_status(self):
         """Check if CUPS is running and has claimed the printer"""
@@ -595,12 +672,20 @@ class DS620Updater:
         self.send_command("PFW_UPDFLASH_REWRITE")
         time.sleep(WAIT_CHMODE)
         
-        response = self.read_response()
+        response = self.read_response(timeout=15000)  # 15 second timeout
         if response:
             self.logger.info("Entered update mode (LED should be flashing green)")
+            if self.logger.level == logging.DEBUG:
+                self.logger.debug(f"Update mode response: {response.hex()}")
+                self.logger.debug(f"Update mode response ASCII: {response.decode('ascii', errors='replace')}")
             return True
         else:
             self.logger.error("Failed to enter update mode")
+            self.logger.error("Check if:")
+            self.logger.error("  - Printer is ready (not busy)")
+            self.logger.error("  - Cover is closed")
+            self.logger.error("  - No active print jobs")
+            self.logger.error("  - Media is loaded")
             return False
             
     def send_firmware(self):
@@ -612,7 +697,7 @@ class DS620Updater:
             with open(self.firmware_path, 'rb') as f:
                 firmware_data = f.read()
                 
-            self.logger.info(f"Firmware size: {len(firmware_data)} bytes")
+            self.logger.info(f"Firmware size: {len(firmware_data)} bytes ({len(firmware_data)/1024/1024:.1f} MB)")
             
             # Send firmware update command with data length
             # Using PTBL_WTCTRLD_UPDATE for main firmware
@@ -628,23 +713,39 @@ class DS620Updater:
             
             chunk_size = 4096
             total_sent = 0
+            start_time = time.time()
+            last_log_time = start_time
             
             while total_sent < len(firmware_data):
                 chunk = firmware_data[total_sent:total_sent + chunk_size]
                 self.ep_out.write(chunk)
                 total_sent += len(chunk)
                 
-                # Progress indicator
-                progress = (total_sent / len(firmware_data)) * 100
-                if total_sent % (chunk_size * 10) == 0:
-                    self.logger.info(f"Progress: {progress:.1f}% ({total_sent}/{len(firmware_data)})")
+                # Progress indicator with time estimate
+                current_time = time.time()
+                if current_time - last_log_time >= 2.0:  # Log every 2 seconds
+                    progress = (total_sent / len(firmware_data)) * 100
+                    elapsed = current_time - start_time
+                    if total_sent > 0:
+                        rate = total_sent / elapsed  # bytes per second
+                        remaining_bytes = len(firmware_data) - total_sent
+                        eta = remaining_bytes / rate
+                        self.logger.info(f"Progress: {progress:.1f}% | {total_sent/1024/1024:.1f}/{len(firmware_data)/1024/1024:.1f} MB | "
+                                       f"Speed: {rate/1024:.1f} KB/s | ETA: {eta:.0f}s")
+                    else:
+                        self.logger.info(f"Progress: {progress:.1f}% ({total_sent}/{len(firmware_data)})")
+                    last_log_time = current_time
                     
                 # Small delay between chunks
                 time.sleep(0.001)
                 
-            self.logger.info("Firmware transmission complete")
+            # Final progress
+            elapsed = time.time() - start_time
+            self.logger.info(f"Firmware transmission complete in {elapsed:.1f} seconds")
+            self.logger.info(f"Average speed: {len(firmware_data)/elapsed/1024:.1f} KB/s")
             
             # Wait for response
+            self.logger.info("Waiting for printer to process firmware...")
             time.sleep(1.0)
             response = self.read_response(timeout=10000)
             if response:
@@ -875,9 +976,38 @@ class DS620Updater:
             if self.device:
                 usb.util.dispose_resources(self.device)
             
+    def manage_cups(self, action='stop'):
+        """Stop or start CUPS service"""
+        if action == 'stop':
+            # Check if CUPS is running first
+            try:
+                result = subprocess.run(['systemctl', 'is-active', 'cups'], 
+                                      capture_output=True, text=True)
+                if result.stdout.strip() == 'active':
+                    self.cups_was_running = True
+                    self.logger.info("Stopping CUPS service...")
+                    
+                    # Stop cups-browsed first if it exists
+                    subprocess.run(['sudo', 'systemctl', 'stop', 'cups-browsed'], 
+                                 capture_output=True)
+                    
+                    # Stop main CUPS service
+                    subprocess.run(['sudo', 'systemctl', 'stop', 'cups'], 
+                                 capture_output=True, check=True)
+                    
+                    self.logger.info("CUPS service stopped")
+                    time.sleep(2)  # Give time for USB to be released
+                else:
+                    self.logger.info("CUPS is not running")
+            except Exception as e:
+                self.logger.warning(f"Could not stop CUPS: {e}")
+                
     def run_update(self):
         """Run the complete firmware update process"""
         try:
+            # Stop CUPS to prevent interference
+            self.manage_cups('stop')
+            
             # Find and setup printer
             if not self.find_printer():
                 return False
@@ -893,15 +1023,31 @@ class DS620Updater:
             print("WARNING: Firmware update will begin.")
             print("DO NOT disconnect USB or power during the update!")
             print("The printer may be permanently damaged if interrupted.")
+            print("")
+            print("CUPS has been stopped to prevent interference.")
+            print("It will be restarted after the update.")
             print("="*60 + "\n")
             
             response = input("Continue with firmware update? (yes/no): ")
             if response.lower() != 'yes':
                 self.logger.info("Update cancelled by user")
                 return False
+            
+            # Mark update as in progress
+            self.update_in_progress = True
+            self.logger.info("Starting firmware update...")
+            update_start = time.time()
                 
             # Check current firmware version and CWD versions
             self.check_cwd_versions()
+            
+            # Check printer status before update
+            self.logger.info("Checking printer status before update...")
+            self.send_command("PSTATUS")
+            time.sleep(0.5)
+            status_response = self.read_response()
+            if status_response:
+                self.logger.info(f"Printer status: {status_response.decode('ascii', errors='replace').strip()}")
             
             # Enter update mode
             if not self.enter_update_mode():
@@ -921,10 +1067,15 @@ class DS620Updater:
             # Reset printer
             self.reset_printer()
             
+            # Mark update as complete
+            self.update_in_progress = False
+            update_time = time.time() - update_start
+            
             # Verify update
             if self.verify_update():
-                self.logger.info("Firmware update completed successfully!")
+                self.logger.info(f"Firmware update completed successfully in {update_time:.1f} seconds!")
                 print("\nIMPORTANT: Please reload paper and perform 'Paper Initialization'")
+                print("\nTo restore printer in CUPS, run: ./recover_printer.sh")
                 return True
             else:
                 self.logger.error("Firmware update may have failed")
@@ -932,11 +1083,11 @@ class DS620Updater:
                 
         except Exception as e:
             self.logger.error(f"Update failed with error: {e}")
+            self.update_in_progress = False
             return False
         finally:
-            # Release USB resources
-            if self.device:
-                usb.util.dispose_resources(self.device)
+            # Cleanup will handle USB resources and CUPS restart
+            self.cleanup()
                 
 def main():
     parser = argparse.ArgumentParser(description='DS620A Firmware Updater for Linux')
@@ -944,6 +1095,8 @@ def main():
     parser.add_argument('--cwd-dir', '-c', required=True, help='Directory containing CWD files')
     parser.add_argument('--debug', '-d', action='store_true', help='Enable debug logging')
     parser.add_argument('--dry-run', '-n', action='store_true', help='Perform dry run - check versions without updating')
+    parser.add_argument('--log-file', '-l', help='Log all output to specified file')
+    parser.add_argument('--no-cups', action='store_true', help='Do not automatically stop/start CUPS')
     
     args = parser.parse_args()
     
@@ -962,13 +1115,27 @@ def main():
         print(f"Error: CWD directory not found: {cwd_dir}")
         sys.exit(1)
         
+    # Create log file with timestamp if requested
+    log_file = None
+    if args.log_file:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_file = f"{args.log_file}_{timestamp}.log"
+        
     # Create updater
-    updater = DS620Updater(firmware_path, cwd_dir)
+    updater = DS620Updater(firmware_path, cwd_dir, log_file)
+    
+    # Check if running as root for actual updates
+    if not args.dry_run and os.geteuid() != 0:
+        print("WARNING: Not running as root. You may encounter permission issues.")
+        print("Consider running with sudo for actual firmware updates.")
+        print("")
     
     # Run dry-run or actual update
     if args.dry_run:
         success = updater.dry_run()
     else:
+        if args.no_cups:
+            updater.cups_was_running = False  # Disable automatic CUPS management
         success = updater.run_update()
     
     sys.exit(0 if success else 1)
