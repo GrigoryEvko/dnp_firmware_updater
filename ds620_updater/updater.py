@@ -289,9 +289,66 @@ class DS620Updater:
         except Exception as e:
             self.logger.debug(f"✗ Read error: {e}")
             
+    def send_printer_class_request(self):
+        """Send USB printer class-specific requests"""
+        try:
+            # USB Printer Class requests
+            GET_DEVICE_ID = 0x00
+            GET_PORT_STATUS = 0x01
+            SOFT_RESET = 0x02
+            
+            # Get device ID (IEEE 1284 Device ID)
+            self.logger.info("Sending GET_DEVICE_ID request...")
+            try:
+                # bmRequestType: 0xA1 (Device to Host, Class, Interface)
+                # bRequest: 0x00 (GET_DEVICE_ID)
+                # wValue: 0
+                # wIndex: Interface number (0)
+                # wLength: 1024 (max expected response)
+                device_id = self.device.ctrl_transfer(0xA1, GET_DEVICE_ID, 0, 0, 1024, timeout=1000)
+                if device_id and len(device_id) > 2:
+                    # First two bytes are length (big-endian)
+                    id_len = (device_id[0] << 8) | device_id[1]
+                    id_string = device_id[2:2+id_len].decode('ascii', errors='ignore')
+                    self.logger.info(f"Device ID: {id_string}")
+            except Exception as e:
+                self.logger.debug(f"GET_DEVICE_ID failed: {e}")
+            
+            # Get port status
+            try:
+                # wLength: 1 (status byte)
+                status = self.device.ctrl_transfer(0xA1, GET_PORT_STATUS, 0, 0, 1, timeout=1000)
+                if status:
+                    self.logger.info(f"Port status: 0x{status[0]:02x}")
+                    # Bit 5: Paper Empty
+                    # Bit 4: Select
+                    # Bit 3: Not Error
+                    if status[0] & 0x20:
+                        self.logger.warning("Paper empty detected")
+            except Exception as e:
+                self.logger.debug(f"GET_PORT_STATUS failed: {e}")
+                
+            # Try soft reset for 0x1452 devices
+            if self.vendor_id == 0x1452:
+                self.logger.info("Sending SOFT_RESET for vendor 0x1452...")
+                try:
+                    # bmRequestType: 0x21 (Host to Device, Class, Interface)
+                    # No data phase
+                    self.device.ctrl_transfer(0x21, SOFT_RESET, 0, 0, timeout=1000)
+                    time.sleep(0.5)  # Give device time to reset
+                    self.logger.info("Soft reset completed")
+                except Exception as e:
+                    self.logger.debug(f"SOFT_RESET failed: {e}")
+                    
+        except Exception as e:
+            self.logger.warning(f"Printer class requests failed: {e}")
+    
     def initialize_printer(self):
         """Initialize printer communication"""
         self.logger.info("Initializing printer communication...")
+        
+        # Send USB printer class requests first
+        self.send_printer_class_request()
         
         # Run raw USB test in debug mode
         if self.logger.level == logging.DEBUG:
@@ -300,28 +357,37 @@ class DS620Updater:
         # Special handling for vendor 0x1452
         if hasattr(self, 'vendor_id') and self.vendor_id == 0x1452:
             self.logger.info("Using alternate initialization for vendor 0x1452")
-            # Try different timeout for this vendor
-            timeout = 10000  # 10 seconds
             
-            # Try alternative initialization sequences
-            if self.logger.level == logging.DEBUG:
-                self.logger.debug("Trying alternative initialization sequences...")
-                
-                # Try 1: Just ESC
+            # Try IEEE-1284.4 style initialization
+            # Some printers need specific initialization sequences
+            init_sequences = [
+                b'\x00',  # Null byte
+                b'\x1b%-12345X',  # UEL (Universal Exit Language)
+                b'\x1b%-12345X@PJL\r\n',  # PJL entry
+                b'@PJL INFO STATUS\r\n',  # PJL status
+                b'\x1b',  # Simple ESC
+                b'STATUS\r\n',  # Plain status
+            ]
+            
+            for seq in init_sequences:
                 try:
-                    self.ep_out.write(b'\x1b')
+                    self.logger.debug(f"Trying init sequence: {seq.hex()}")
+                    self.ep_out.write(seq)
                     time.sleep(0.1)
-                    self.logger.debug("Sent ESC byte")
-                except:
-                    pass
                     
-                # Try 2: Simple status without protocol
-                try:
-                    self.ep_out.write(b'STATUS\r\n')
-                    time.sleep(0.1)
-                    self.logger.debug("Sent plain STATUS")
-                except:
-                    pass
+                    # Try to read any response
+                    try:
+                        data = self.ep_in.read(1024, timeout=100)
+                        if data:
+                            self.logger.info(f"Got response to {seq.hex()}: {data.hex()}")
+                            self.logger.info(f"ASCII: {bytes(data).decode('ascii', errors='replace')}")
+                            break
+                    except usb.core.USBTimeoutError:
+                        pass
+                except Exception as e:
+                    self.logger.debug(f"Failed to send {seq.hex()}: {e}")
+            
+            timeout = 10000  # 10 seconds
         else:
             timeout = 5000  # 5 seconds
         
@@ -339,17 +405,67 @@ class DS620Updater:
             
     def send_command(self, command, data=None):
         """Send command to printer"""
-        # Format: ESC + command (padded to 24 bytes total) + data + CRLF
-        # Commands already include the 'P' prefix where needed
-        cmd_bytes = bytes([ESC]) + command.encode('ascii')
-        
-        # Ensure command is exactly 23 bytes (24 total with ESC)
-        if len(cmd_bytes) < 24:
-            cmd_bytes += b' ' * (24 - len(cmd_bytes))
-        
-        if data:
-            cmd_bytes += data
-        cmd_bytes += CRLF
+        # Special handling for vendor 0x1452 - try different formats
+        if hasattr(self, 'vendor_id') and self.vendor_id == 0x1452:
+            # Try multiple command formats for 0x1452
+            formats_to_try = [
+                # Format 1: No ESC prefix, just command
+                lambda cmd: cmd.encode('ascii') + CRLF,
+                # Format 2: Standard ESC format
+                lambda cmd: bytes([ESC]) + cmd.encode('ascii').ljust(23) + CRLF,
+                # Format 3: PJL format
+                lambda cmd: b'@PJL ' + cmd.encode('ascii') + CRLF,
+                # Format 4: Raw command with spaces
+                lambda cmd: cmd.encode('ascii') + b'                    \r\n',
+            ]
+            
+            # Only try multiple formats for the first command
+            if not hasattr(self, '_format_found'):
+                for i, format_func in enumerate(formats_to_try):
+                    try:
+                        cmd_bytes = format_func(command)
+                        if data:
+                            cmd_bytes = cmd_bytes[:-2] + data + CRLF  # Remove CRLF and re-add
+                        
+                        if self.logger.level == logging.DEBUG:
+                            self.logger.debug(f"Trying format {i+1} for command: {command}")
+                            self.logger.debug(f"Raw hex: {cmd_bytes.hex()}")
+                        
+                        bytes_written = self.ep_out.write(cmd_bytes)
+                        
+                        # Try to read response immediately
+                        try:
+                            response = self.ep_in.read(1024, timeout=500)
+                            if response:
+                                self.logger.info(f"Format {i+1} worked! Got response")
+                                self._format_found = i
+                                self._format_func = format_func
+                                return
+                        except usb.core.USBTimeoutError:
+                            pass
+                            
+                    except Exception as e:
+                        self.logger.debug(f"Format {i+1} failed: {e}")
+                        
+                # If no format worked, use the last one
+                self._format_found = 0
+                self._format_func = formats_to_try[0]
+            
+            # Use the format that worked (or default)
+            cmd_bytes = self._format_func(command)
+            if data:
+                cmd_bytes = cmd_bytes[:-2] + data + CRLF
+        else:
+            # Standard format for other vendors
+            cmd_bytes = bytes([ESC]) + command.encode('ascii')
+            
+            # Ensure command is exactly 23 bytes (24 total with ESC)
+            if len(cmd_bytes) < 24:
+                cmd_bytes += b' ' * (24 - len(cmd_bytes))
+            
+            if data:
+                cmd_bytes += data
+            cmd_bytes += CRLF
         
         # Enhanced debug logging
         if self.logger.level == logging.DEBUG:
