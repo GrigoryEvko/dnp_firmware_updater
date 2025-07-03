@@ -33,10 +33,11 @@ class TestProtocol:
     
     def test_usb_device_ids(self):
         """Test USB device ID constants"""
-        from ds620_updater.updater import DNP_VENDOR_ID, PRODUCT_IDS
+        from ds620_updater.updater import DNP_VENDOR_IDS, PRODUCT_IDS
         
-        assert DNP_VENDOR_ID == 0x1343
-        assert 0x0001 in PRODUCT_IDS
-        assert 0x0002 in PRODUCT_IDS
-        assert 0xFFFF in PRODUCT_IDS
-        assert len(PRODUCT_IDS) == 11
+        assert 0x1343 in DNP_VENDOR_IDS
+        assert 0x1452 in DNP_VENDOR_IDS
+        assert 0x0001 in PRODUCT_IDS[0x1343]
+        assert 0x8b01 in PRODUCT_IDS[0x1452]
+        assert len(PRODUCT_IDS[0x1343]) == 11
+        assert len(PRODUCT_IDS[0x1452]) == 6

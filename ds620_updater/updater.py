@@ -18,8 +18,11 @@ except ImportError:
     sys.exit(1)
 
 # USB Device IDs for DS620A
-DNP_VENDOR_ID = 0x1343
-PRODUCT_IDS = [0x0001, 0x0002, 0x0003, 0x0004, 0x0005, 0x0006, 0x0007, 0x0008, 0x0009, 0x1001, 0xFFFF]
+DNP_VENDOR_IDS = [0x1343, 0x1452]  # DNP and alternate vendor ID
+PRODUCT_IDS = {
+    0x1343: [0x0001, 0x0002, 0x0003, 0x0004, 0x0005, 0x0006, 0x0007, 0x0008, 0x0009, 0x1001, 0xFFFF],
+    0x1452: [0x8b01, 0x8b02, 0x9001, 0x9201, 0x9301, 0x9401]
+}
 
 # Protocol constants
 ESC = 0x1B  # Control character
@@ -48,13 +51,15 @@ class DS620Updater:
         
     def find_printer(self):
         """Find DS620A printer via USB"""
-        for pid in PRODUCT_IDS:
-            self.device = usb.core.find(idVendor=DNP_VENDOR_ID, idProduct=pid)
-            if self.device:
-                self.logger.info(f"Found DS620A printer: VID={hex(DNP_VENDOR_ID)}, PID={hex(pid)}")
-                return True
+        for vid in DNP_VENDOR_IDS:
+            for pid in PRODUCT_IDS.get(vid, []):
+                self.device = usb.core.find(idVendor=vid, idProduct=pid)
+                if self.device:
+                    self.logger.info(f"Found DS620A printer: VID={hex(vid)}, PID={hex(pid)}")
+                    return True
         
         self.logger.error("DS620A printer not found. Please ensure it's connected via USB.")
+        self.logger.error("Looking for VID:PID combinations: 1343:xxxx and 1452:xxxx")
         return False
         
     def setup_usb(self):
