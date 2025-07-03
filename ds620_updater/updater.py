@@ -76,60 +76,79 @@ class DS620Updater:
             
             self.logger.info(f"Attempting to unbind usblp driver from bus {bus}, device {address}")
             
-            # Find the device in sysfs
+            # Method 1: Try direct unbind using lsusb output format
+            # The interface is typically bus-port:config.interface (e.g., "1-4:1.0")
             import subprocess
             
-            # First, find the USB device path
+            # Get the device path from lsusb
             result = subprocess.run(
-                ["find", "/sys/bus/usb/devices/", "-name", f"{bus}-*"],
+                ["lsusb", "-t"],
                 capture_output=True,
                 text=True
             )
             
-            if result.returncode != 0:
-                self.logger.warning("Could not find device in sysfs")
-                return False
-                
-            # Look for the specific device
-            for path in result.stdout.strip().split('\n'):
-                if not path:
-                    continue
-                    
-                # Check if this is our device
-                try:
-                    with open(f"{path}/devnum", 'r') as f:
-                        devnum = int(f.read().strip())
-                    with open(f"{path}/busnum", 'r') as f:
-                        busnum = int(f.read().strip())
+            if self.logger.level == logging.DEBUG:
+                self.logger.debug(f"lsusb -t output:\n{result.stdout}")
+            
+            # Method 2: Find the correct sysfs path
+            # USB devices in sysfs follow pattern: /sys/bus/usb/devices/busnum-port[.port...]
+            sysfs_base = "/sys/bus/usb/devices/"
+            
+            # Try to find files that match our bus
+            try:
+                import glob
+                # Look for all devices on this bus
+                for device_path in glob.glob(f"{sysfs_base}{bus}-*"):
+                    if not os.path.isdir(device_path):
+                        continue
                         
-                    if devnum == address and busnum == bus:
-                        # Found our device, now unbind usblp
-                        interface_path = f"{path}:1.0"
-                        unbind_path = "/sys/bus/usb/drivers/usblp/unbind"
-                        
-                        if os.path.exists(unbind_path):
-                            # Get the interface name (e.g., "1-4:1.0")
-                            interface_name = os.path.basename(interface_path)
-                            
-                            self.logger.info(f"Unbinding usblp from interface {interface_name}")
-                            
-                            # Write to unbind
-                            with open(unbind_path, 'w') as f:
-                                f.write(interface_name)
+                    # Check if this is our device by reading devnum
+                    try:
+                        devnum_path = os.path.join(device_path, "devnum")
+                        if os.path.exists(devnum_path):
+                            with open(devnum_path, 'r') as f:
+                                devnum = int(f.read().strip())
                                 
-                            self.logger.info("Successfully unbound usblp driver")
-                            time.sleep(0.5)  # Give system time to release
-                            return True
-                except Exception as e:
-                    self.logger.debug(f"Error checking {path}: {e}")
-                    continue
-                    
-            self.logger.warning("Could not find device to unbind")
-            return False
+                            if devnum == address:
+                                # Found our device! Now try to unbind usblp
+                                self.logger.info(f"Found device at {device_path}")
+                                
+                                # The interface is typically :1.0 for first interface
+                                interface_name = os.path.basename(device_path) + ":1.0"
+                                unbind_path = "/sys/bus/usb/drivers/usblp/unbind"
+                                
+                                if os.path.exists(unbind_path):
+                                    self.logger.info(f"Unbinding usblp from interface {interface_name}")
+                                    try:
+                                        with open(unbind_path, 'w') as f:
+                                            f.write(interface_name + "\n")
+                                        self.logger.info("Successfully unbound usblp driver")
+                                        time.sleep(0.5)  # Give system time to release
+                                        return True
+                                    except IOError as e:
+                                        if "No such device" in str(e):
+                                            self.logger.info("Device not bound to usblp (already unbound?)")
+                                            return True
+                                        else:
+                                            self.logger.warning(f"Failed to write to unbind: {e}")
+                                else:
+                                    self.logger.warning("usblp unbind path not found - driver might not be loaded")
+                                    return True  # Not an error if usblp isn't loaded
+                                    
+                    except Exception as e:
+                        self.logger.debug(f"Error checking {device_path}: {e}")
+                        continue
+                        
+            except Exception as e:
+                self.logger.warning(f"Error searching sysfs: {e}")
+                
+            # If we get here, we couldn't find the device
+            self.logger.warning("Could not find device in sysfs - attempting to continue anyway")
+            return True  # Try to continue even if unbind failed
             
         except Exception as e:
             self.logger.warning(f"Failed to unbind usblp: {e}")
-            return False
+            return True  # Try to continue even if unbind failed
     
     def setup_usb(self):
         """Setup USB communication endpoints"""
