@@ -56,6 +56,8 @@ class DS620Updater:
                 self.device = usb.core.find(idVendor=vid, idProduct=pid)
                 if self.device:
                     self.logger.info(f"Found DS620A printer: VID={hex(vid)}, PID={hex(pid)}")
+                    self.vendor_id = vid
+                    self.product_id = pid
                     return True
         
         self.logger.error("DS620A printer not found. Please ensure it's connected via USB.")
@@ -92,6 +94,15 @@ class DS620Updater:
                 
             self.logger.info("USB communication established")
             
+            if self.logger.level == logging.DEBUG:
+                self.logger.debug(f"OUT endpoint: 0x{self.ep_out.bEndpointAddress:02x}")
+                self.logger.debug(f"IN endpoint: 0x{self.ep_in.bEndpointAddress:02x}")
+                self.logger.debug(f"Device: {self.device}")
+                self.logger.debug(f"Configuration: {cfg}")
+            
+            # Clear any pending data
+            self.clear_usb_buffers()
+            
             # Initialize printer communication
             self.initialize_printer()
             
@@ -101,17 +112,41 @@ class DS620Updater:
             self.logger.error(f"USB setup failed: {e}")
             return False
             
+    def clear_usb_buffers(self):
+        """Clear any pending data from USB buffers"""
+        if self.logger.level == logging.DEBUG:
+            self.logger.debug("Clearing USB buffers...")
+        
+        try:
+            while True:
+                data = self.ep_in.read(1024, timeout=100)
+                if self.logger.level == logging.DEBUG:
+                    self.logger.debug(f"Cleared {len(data)} bytes from input buffer")
+        except usb.core.USBTimeoutError:
+            # No more data to read
+            pass
+            
     def initialize_printer(self):
         """Initialize printer communication"""
         self.logger.info("Initializing printer communication...")
         
+        # Special handling for vendor 0x1452
+        if hasattr(self, 'vendor_id') and self.vendor_id == 0x1452:
+            self.logger.info("Using alternate initialization for vendor 0x1452")
+            # Try different timeout for this vendor
+            timeout = 10000  # 10 seconds
+        else:
+            timeout = 5000  # 5 seconds
+        
         # Send STATUS command to verify communication
         self.send_command("PSTATUS")
         time.sleep(0.5)
-        response = self.read_response()
+        response = self.read_response(timeout=timeout)
         
         if response:
             self.logger.info("Printer communication initialized")
+            if self.logger.level == logging.DEBUG:
+                self.logger.debug(f"STATUS response: {response.decode('ascii', errors='replace')}")
         else:
             self.logger.warning("No response to STATUS command, continuing anyway...")
             
@@ -129,20 +164,59 @@ class DS620Updater:
             cmd_bytes += data
         cmd_bytes += CRLF
         
-        self.logger.debug(f"Sending: {cmd_bytes}")
-        self.ep_out.write(cmd_bytes)
+        # Enhanced debug logging
+        if self.logger.level == logging.DEBUG:
+            self.logger.debug(f"Sending command: {command}")
+            self.logger.debug(f"Raw hex: {cmd_bytes.hex()}")
+            self.logger.debug(f"ASCII: {cmd_bytes.decode('ascii', errors='replace')}")
+            self.logger.debug(f"Total length: {len(cmd_bytes)} bytes")
+        
+        try:
+            bytes_written = self.ep_out.write(cmd_bytes)
+            if self.logger.level == logging.DEBUG:
+                self.logger.debug(f"Wrote {bytes_written} bytes to endpoint 0x{self.ep_out.bEndpointAddress:02x}")
+        except Exception as e:
+            self.logger.error(f"Failed to write to USB: {e}")
+            raise
         
     def read_response(self, timeout=5000, retry_count=3):
         """Read response from printer with retry logic"""
         for attempt in range(retry_count):
             try:
-                response = self.ep_in.read(1024, timeout)
-                return bytes(response)
+                # First try to read potential length field
+                initial_read = self.ep_in.read(1024, timeout)
+                response = bytes(initial_read)
+                
+                if self.logger.level == logging.DEBUG:
+                    self.logger.debug(f"Read {len(response)} bytes from endpoint 0x{self.ep_in.bEndpointAddress:02x}")
+                    self.logger.debug(f"Raw hex: {response.hex()}")
+                    self.logger.debug(f"ASCII: {response.decode('ascii', errors='replace')}")
+                
+                # Check if response starts with 8-digit length
+                if len(response) >= 8 and response[:8].decode('ascii', errors='ignore').isdigit():
+                    length = int(response[:8].decode('ascii'))
+                    self.logger.debug(f"Detected length-prefixed response: {length} bytes expected")
+                    
+                    # If we have the full response already
+                    if len(response) >= 8 + length:
+                        return response[8:8+length]
+                    
+                    # Otherwise, read the remaining data
+                    remaining = length - (len(response) - 8)
+                    if remaining > 0:
+                        more_data = self.ep_in.read(remaining, timeout)
+                        response += bytes(more_data)
+                        return response[8:8+length]
+                
+                return response
+                
             except usb.core.USBTimeoutError:
                 if attempt < retry_count - 1:
                     self.logger.debug(f"Read timeout, retrying... ({attempt + 1}/{retry_count})")
                     time.sleep(0.1)
                 else:
+                    if self.logger.level == logging.DEBUG:
+                        self.logger.debug(f"Read timeout after {retry_count} attempts")
                     return None
         return None
             
