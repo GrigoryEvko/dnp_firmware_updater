@@ -9,6 +9,7 @@ import os
 import time
 import argparse
 import logging
+import subprocess
 from pathlib import Path
 
 try:
@@ -52,8 +53,58 @@ class DS620Updater:
         # Inherit parent logger level (for --debug flag)
         self.logger.setLevel(logging.getLogger().level)
         
+    def check_cups_status(self):
+        """Check if CUPS is running and has claimed the printer"""
+        cups_running = False
+        printer_in_cups = False
+        cups_printer_name = None
+        
+        try:
+            # Check if CUPS is running
+            result = subprocess.run(['systemctl', 'is-active', 'cups'], 
+                                  capture_output=True, text=True)
+            cups_running = result.stdout.strip() == 'active'
+            
+            if cups_running:
+                # Check if DS620 is configured in CUPS
+                result = subprocess.run(['lpstat', '-v'], 
+                                      capture_output=True, text=True)
+                for line in result.stdout.split('\n'):
+                    if 'dnp-ds620' in line.lower() or 'ds620' in line.lower():
+                        printer_in_cups = True
+                        # Extract printer name
+                        if line.startswith('device for '):
+                            cups_printer_name = line.split(':')[0].replace('device for ', '')
+                        self.logger.warning(f"DS620 is configured in CUPS: {line}")
+                        
+        except Exception as e:
+            self.logger.debug(f"Could not check CUPS status: {e}")
+            
+        return cups_running, printer_in_cups, cups_printer_name
+    
     def find_printer(self):
         """Find DS620A printer via USB"""
+        # Check CUPS status first
+        cups_running, printer_in_cups, cups_printer_name = self.check_cups_status()
+        
+        if printer_in_cups:
+            self.logger.warning("="*60)
+            self.logger.warning("WARNING: DS620 printer is configured in CUPS!")
+            self.logger.warning("This may prevent direct USB access.")
+            self.logger.warning("")
+            self.logger.warning("Options to fix this:")
+            self.logger.warning("1. Temporarily stop CUPS: sudo systemctl stop cups")
+            self.logger.warning(f"2. Remove printer from CUPS: sudo lpadmin -x {cups_printer_name}")
+            self.logger.warning("3. Run this updater with sudo")
+            self.logger.warning("")
+            self.logger.warning("After update, restart CUPS: sudo systemctl start cups")
+            self.logger.warning("="*60)
+            
+            # Check if we're running as root
+            if os.geteuid() != 0:
+                self.logger.error("Not running as root. CUPS may block USB access.")
+                self.logger.error("Try running with sudo.")
+        
         for vid in DNP_VENDOR_IDS:
             for pid in PRODUCT_IDS.get(vid, []):
                 self.device = usb.core.find(idVendor=vid, idProduct=pid)
@@ -65,6 +116,12 @@ class DS620Updater:
         
         self.logger.error("DS620A printer not found. Please ensure it's connected via USB.")
         self.logger.error("Looking for VID:PID combinations: 1343:xxxx and 1452:xxxx")
+        
+        if cups_running:
+            self.logger.error("")
+            self.logger.error("CUPS is running and may be blocking USB access.")
+            self.logger.error("Try: sudo systemctl stop cups")
+            
         return False
         
     def unbind_usblp(self):
@@ -356,38 +413,15 @@ class DS620Updater:
         
         # Special handling for vendor 0x1452
         if hasattr(self, 'vendor_id') and self.vendor_id == 0x1452:
-            self.logger.info("Using alternate initialization for vendor 0x1452")
-            
-            # Try IEEE-1284.4 style initialization
-            # Some printers need specific initialization sequences
-            init_sequences = [
-                b'\x00',  # Null byte
-                b'\x1b%-12345X',  # UEL (Universal Exit Language)
-                b'\x1b%-12345X@PJL\r\n',  # PJL entry
-                b'@PJL INFO STATUS\r\n',  # PJL status
-                b'\x1b',  # Simple ESC
-                b'STATUS\r\n',  # Plain status
-            ]
-            
-            for seq in init_sequences:
-                try:
-                    self.logger.debug(f"Trying init sequence: {seq.hex()}")
-                    self.ep_out.write(seq)
-                    time.sleep(0.1)
-                    
-                    # Try to read any response
-                    try:
-                        data = self.ep_in.read(1024, timeout=100)
-                        if data:
-                            self.logger.info(f"Got response to {seq.hex()}: {data.hex()}")
-                            self.logger.info(f"ASCII: {bytes(data).decode('ascii', errors='replace')}")
-                            break
-                    except usb.core.USBTimeoutError:
-                        pass
-                except Exception as e:
-                    self.logger.debug(f"Failed to send {seq.hex()}: {e}")
-            
+            self.logger.info("Using initialization for vendor 0x1452")
+            # Try longer timeout and different delays
             timeout = 10000  # 10 seconds
+            
+            # Add extra delay after USB setup for 0x1452
+            time.sleep(1.0)
+            
+            if self.logger.level == logging.DEBUG:
+                self.logger.debug("Added 1 second delay for VID 0x1452 initialization")
         else:
             timeout = 5000  # 5 seconds
         
@@ -400,72 +434,22 @@ class DS620Updater:
             self.logger.info("Printer communication initialized")
             if self.logger.level == logging.DEBUG:
                 self.logger.debug(f"STATUS response: {response.decode('ascii', errors='replace')}")
+                self.logger.debug(f"Response hex: {response.hex()}")
         else:
             self.logger.warning("No response to STATUS command, continuing anyway...")
             
     def send_command(self, command, data=None):
         """Send command to printer"""
-        # Special handling for vendor 0x1452 - try different formats
-        if hasattr(self, 'vendor_id') and self.vendor_id == 0x1452:
-            # Try multiple command formats for 0x1452
-            formats_to_try = [
-                # Format 1: No ESC prefix, just command
-                lambda cmd: cmd.encode('ascii') + CRLF,
-                # Format 2: Standard ESC format
-                lambda cmd: bytes([ESC]) + cmd.encode('ascii').ljust(23) + CRLF,
-                # Format 3: PJL format
-                lambda cmd: b'@PJL ' + cmd.encode('ascii') + CRLF,
-                # Format 4: Raw command with spaces
-                lambda cmd: cmd.encode('ascii') + b'                    \r\n',
-            ]
-            
-            # Only try multiple formats for the first command
-            if not hasattr(self, '_format_found'):
-                for i, format_func in enumerate(formats_to_try):
-                    try:
-                        cmd_bytes = format_func(command)
-                        if data:
-                            cmd_bytes = cmd_bytes[:-2] + data + CRLF  # Remove CRLF and re-add
-                        
-                        if self.logger.level == logging.DEBUG:
-                            self.logger.debug(f"Trying format {i+1} for command: {command}")
-                            self.logger.debug(f"Raw hex: {cmd_bytes.hex()}")
-                        
-                        bytes_written = self.ep_out.write(cmd_bytes)
-                        
-                        # Try to read response immediately
-                        try:
-                            response = self.ep_in.read(1024, timeout=500)
-                            if response:
-                                self.logger.info(f"Format {i+1} worked! Got response")
-                                self._format_found = i
-                                self._format_func = format_func
-                                return
-                        except usb.core.USBTimeoutError:
-                            pass
-                            
-                    except Exception as e:
-                        self.logger.debug(f"Format {i+1} failed: {e}")
-                        
-                # If no format worked, use the last one
-                self._format_found = 0
-                self._format_func = formats_to_try[0]
-            
-            # Use the format that worked (or default)
-            cmd_bytes = self._format_func(command)
-            if data:
-                cmd_bytes = cmd_bytes[:-2] + data + CRLF
-        else:
-            # Standard format for other vendors
-            cmd_bytes = bytes([ESC]) + command.encode('ascii')
-            
-            # Ensure command is exactly 23 bytes (24 total with ESC)
-            if len(cmd_bytes) < 24:
-                cmd_bytes += b' ' * (24 - len(cmd_bytes))
-            
-            if data:
-                cmd_bytes += data
-            cmd_bytes += CRLF
+        # Use standard DNP format for all vendors
+        cmd_bytes = bytes([ESC]) + command.encode('ascii')
+        
+        # Ensure command is exactly 23 bytes (24 total with ESC)
+        if len(cmd_bytes) < 24:
+            cmd_bytes += b' ' * (24 - len(cmd_bytes))
+        
+        if data:
+            cmd_bytes += data
+        cmd_bytes += CRLF
         
         # Enhanced debug logging
         if self.logger.level == logging.DEBUG:
@@ -473,6 +457,10 @@ class DS620Updater:
             self.logger.debug(f"Raw hex: {cmd_bytes.hex()}")
             self.logger.debug(f"ASCII: {cmd_bytes.decode('ascii', errors='replace')}")
             self.logger.debug(f"Total length: {len(cmd_bytes)} bytes")
+            
+            # Special debugging for 0x1452
+            if hasattr(self, 'vendor_id') and self.vendor_id == 0x1452:
+                self.logger.debug(f"VID 0x1452: Using standard DNP format")
         
         try:
             bytes_written = self.ep_out.write(cmd_bytes)
@@ -494,6 +482,13 @@ class DS620Updater:
                     self.logger.debug(f"Read {len(response)} bytes from endpoint 0x{self.ep_in.bEndpointAddress:02x}")
                     self.logger.debug(f"Raw hex: {response.hex()}")
                     self.logger.debug(f"ASCII: {response.decode('ascii', errors='replace')}")
+                    
+                    # Extra debugging for 0x1452
+                    if hasattr(self, 'vendor_id') and self.vendor_id == 0x1452:
+                        self.logger.debug(f"VID 0x1452 response analysis:")
+                        if len(response) > 0:
+                            self.logger.debug(f"  First byte: 0x{response[0]:02x}")
+                            self.logger.debug(f"  Looks like error: {'yes' if response[0] in [0x15, 0x06] else 'no'}")
                 
                 # Check if response starts with 8-digit length
                 if len(response) >= 8 and response[:8].decode('ascii', errors='ignore').isdigit():
@@ -511,6 +506,10 @@ class DS620Updater:
                         response += bytes(more_data)
                         return response[8:8+length]
                 
+                # For 0x1452, log non-standard responses
+                if hasattr(self, 'vendor_id') and self.vendor_id == 0x1452 and len(response) > 0:
+                    self.logger.warning(f"VID 0x1452: Non-standard response format")
+                
                 return response
                 
             except usb.core.USBTimeoutError:
@@ -520,6 +519,8 @@ class DS620Updater:
                 else:
                     if self.logger.level == logging.DEBUG:
                         self.logger.debug(f"Read timeout after {retry_count} attempts")
+                        if hasattr(self, 'vendor_id') and self.vendor_id == 0x1452:
+                            self.logger.debug("VID 0x1452: No response received")
                     return None
         return None
             
