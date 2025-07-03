@@ -5,6 +5,7 @@ Based on reverse engineering of DNP DS620A firmware update protocol
 """
 
 import sys
+import os
 import time
 import argparse
 import logging
@@ -66,9 +67,76 @@ class DS620Updater:
         self.logger.error("Looking for VID:PID combinations: 1343:xxxx and 1452:xxxx")
         return False
         
+    def unbind_usblp(self):
+        """Unbind usblp driver from printer device"""
+        try:
+            # Get device bus and address
+            bus = self.device.bus
+            address = self.device.address
+            
+            self.logger.info(f"Attempting to unbind usblp driver from bus {bus}, device {address}")
+            
+            # Find the device in sysfs
+            import subprocess
+            
+            # First, find the USB device path
+            result = subprocess.run(
+                ["find", "/sys/bus/usb/devices/", "-name", f"{bus}-*"],
+                capture_output=True,
+                text=True
+            )
+            
+            if result.returncode != 0:
+                self.logger.warning("Could not find device in sysfs")
+                return False
+                
+            # Look for the specific device
+            for path in result.stdout.strip().split('\n'):
+                if not path:
+                    continue
+                    
+                # Check if this is our device
+                try:
+                    with open(f"{path}/devnum", 'r') as f:
+                        devnum = int(f.read().strip())
+                    with open(f"{path}/busnum", 'r') as f:
+                        busnum = int(f.read().strip())
+                        
+                    if devnum == address and busnum == bus:
+                        # Found our device, now unbind usblp
+                        interface_path = f"{path}:1.0"
+                        unbind_path = "/sys/bus/usb/drivers/usblp/unbind"
+                        
+                        if os.path.exists(unbind_path):
+                            # Get the interface name (e.g., "1-4:1.0")
+                            interface_name = os.path.basename(interface_path)
+                            
+                            self.logger.info(f"Unbinding usblp from interface {interface_name}")
+                            
+                            # Write to unbind
+                            with open(unbind_path, 'w') as f:
+                                f.write(interface_name)
+                                
+                            self.logger.info("Successfully unbound usblp driver")
+                            time.sleep(0.5)  # Give system time to release
+                            return True
+                except Exception as e:
+                    self.logger.debug(f"Error checking {path}: {e}")
+                    continue
+                    
+            self.logger.warning("Could not find device to unbind")
+            return False
+            
+        except Exception as e:
+            self.logger.warning(f"Failed to unbind usblp: {e}")
+            return False
+    
     def setup_usb(self):
         """Setup USB communication endpoints"""
         try:
+            # Try to unbind usblp driver first
+            self.unbind_usblp()
+            
             # Detach kernel driver if active
             if self.device.is_kernel_driver_active(0):
                 self.device.detach_kernel_driver(0)
