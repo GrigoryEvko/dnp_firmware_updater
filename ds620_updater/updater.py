@@ -48,6 +48,8 @@ class DS620Updater:
         # Setup logging
         logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
         self.logger = logging.getLogger(__name__)
+        # Inherit parent logger level (for --debug flag)
+        self.logger.setLevel(logging.getLogger().level)
         
     def find_printer(self):
         """Find DS620A printer via USB"""
@@ -103,6 +105,10 @@ class DS620Updater:
             # Clear any pending data
             self.clear_usb_buffers()
             
+            # Run diagnostics if in debug mode
+            if self.logger.level == logging.DEBUG:
+                self.diagnose_usb()
+            
             # Initialize printer communication
             self.initialize_printer()
             
@@ -126,15 +132,109 @@ class DS620Updater:
             # No more data to read
             pass
             
+    def diagnose_usb(self):
+        """Print detailed USB device information for debugging"""
+        self.logger.debug("=== USB Device Diagnostics ===")
+        try:
+            self.logger.debug(f"Vendor: 0x{self.device.idVendor:04x}")
+            self.logger.debug(f"Product: 0x{self.device.idProduct:04x}")
+            
+            # Try to get device strings
+            try:
+                manufacturer = usb.util.get_string(self.device, self.device.iManufacturer)
+                self.logger.debug(f"Manufacturer: {manufacturer}")
+            except:
+                self.logger.debug("Manufacturer: (unable to read)")
+                
+            try:
+                product = usb.util.get_string(self.device, self.device.iProduct)
+                self.logger.debug(f"Product Name: {product}")
+            except:
+                self.logger.debug("Product Name: (unable to read)")
+                
+            try:
+                serial = usb.util.get_string(self.device, self.device.iSerialNumber)
+                self.logger.debug(f"Serial: {serial}")
+            except:
+                self.logger.debug("Serial: (unable to read)")
+            
+            # List all configurations and interfaces
+            for cfg in self.device:
+                self.logger.debug(f"\nConfiguration {cfg.bConfigurationValue}:")
+                for intf in cfg:
+                    self.logger.debug(f"  Interface {intf.bInterfaceNumber}, Alt {intf.bAlternateSetting}:")
+                    self.logger.debug(f"    Class: 0x{intf.bInterfaceClass:02x} (0x07=Printer)")
+                    self.logger.debug(f"    Subclass: 0x{intf.bInterfaceSubClass:02x}")
+                    self.logger.debug(f"    Protocol: 0x{intf.bInterfaceProtocol:02x}")
+                    
+                    for ep in intf:
+                        direction = "IN" if ep.bEndpointAddress & 0x80 else "OUT"
+                        ep_type = ["Control", "Isochronous", "Bulk", "Interrupt"][ep.bmAttributes & 0x03]
+                        self.logger.debug(f"    Endpoint 0x{ep.bEndpointAddress:02x}: {direction} {ep_type}, MaxPacket={ep.wMaxPacketSize}")
+                        
+        except Exception as e:
+            self.logger.debug(f"Error during USB diagnostics: {e}")
+            
+    def test_raw_usb(self):
+        """Test raw USB communication for debugging"""
+        self.logger.debug("=== Testing Raw USB Communication ===")
+        
+        # Test 1: Single byte write
+        try:
+            self.ep_out.write(b'\x1b')
+            self.logger.debug("✓ Successfully wrote single ESC byte")
+        except Exception as e:
+            self.logger.debug(f"✗ Failed to write single byte: {e}")
+            
+        # Test 2: Simple string
+        try:
+            self.ep_out.write(b'PSTATUS\r\n')
+            self.logger.debug("✓ Successfully wrote simple command")
+        except Exception as e:
+            self.logger.debug(f"✗ Failed to write simple command: {e}")
+            
+        # Test 3: Try to read any response
+        try:
+            data = self.ep_in.read(64, timeout=1000)
+            self.logger.debug(f"✓ Read {len(data)} bytes: {data.hex()}")
+        except usb.core.USBTimeoutError:
+            self.logger.debug("✗ No data available to read (timeout)")
+        except Exception as e:
+            self.logger.debug(f"✗ Read error: {e}")
+            
     def initialize_printer(self):
         """Initialize printer communication"""
         self.logger.info("Initializing printer communication...")
+        
+        # Run raw USB test in debug mode
+        if self.logger.level == logging.DEBUG:
+            self.test_raw_usb()
         
         # Special handling for vendor 0x1452
         if hasattr(self, 'vendor_id') and self.vendor_id == 0x1452:
             self.logger.info("Using alternate initialization for vendor 0x1452")
             # Try different timeout for this vendor
             timeout = 10000  # 10 seconds
+            
+            # Try alternative initialization sequences
+            if self.logger.level == logging.DEBUG:
+                self.logger.debug("Trying alternative initialization sequences...")
+                
+                # Try 1: Just ESC
+                try:
+                    self.ep_out.write(b'\x1b')
+                    time.sleep(0.1)
+                    self.logger.debug("Sent ESC byte")
+                except:
+                    pass
+                    
+                # Try 2: Simple status without protocol
+                try:
+                    self.ep_out.write(b'STATUS\r\n')
+                    time.sleep(0.1)
+                    self.logger.debug("Sent plain STATUS")
+                except:
+                    pass
         else:
             timeout = 5000  # 5 seconds
         
