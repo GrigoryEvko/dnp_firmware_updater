@@ -1,169 +1,228 @@
-# DS620A Firmware Update Protocol Documentation
+# DS620A Firmware Update Protocol
 
-This document describes the reverse-engineered protocol used by the DNP DS620A photo printer for firmware updates.
+Reverse-engineered from IDA Pro decompilation of `cspstat64.dll` (native USB comms library)
+and `CSJCX2lm.dll` (Windows language monitor). Verified against `.NET` updater call sequence.
 
 ## USB Communication
 
 ### Device Identification
-- **Vendor ID**: 0x1343 (DNP - Dai Nippon Printing)
-- **Product IDs**: 
-  - 0x0001 through 0x0009
-  - 0x1001
-  - 0xFFFF
+| VID | PID | Model |
+|-----|-----|-------|
+| 0x1452 | 0x8b01 | DS620 / Citizen CX-02 |
+| 0x1452 | 0x8b02 | DS620 (alternate) |
+| 0x1452 | 0x9001 | DS820 |
+| 0x1452 | 0x9401 | DS820DX |
+| 0x1343 | 0x0003 | DS40 |
+| 0x1343 | 0x0004 | DS80 |
+| 0x1343 | 0x0005 | DS-RX1 |
+| 0x1343 | 0xFFFF | QW410 |
+
+Windows uses `SetupDiGetClassDevs` + `CreateFile` + `WriteFile`/`ReadFile` (raw USB class driver).
+Linux equivalent: pyusb bulk OUT/IN endpoints on interface 0.
 
 ### Endpoints
-- Uses standard USB bulk transfer endpoints
-- OUT endpoint for sending commands/data
-- IN endpoint for receiving responses
+- Bulk OUT: send commands and data
+- Bulk IN: receive responses
 
-## Command Protocol
+### Global Mutex
+`Global\CSMUTX` serializes all USB access (relevant for multi-process scenarios).
 
-### Command Format
-All commands follow a fixed 24-byte format:
+## Wire Protocol
+
+### Command Frame Format
+
+**ALL commands are exactly 32 bytes. NO CRLF termination.**
+
 ```
-[ESC][Command Text][Padding Spaces]
+[ESC][31 bytes ASCII, space-padded]
 ```
+Where ESC = 0x1B (decimal 27).
 
-- **ESC**: 0x1B (Escape character)
-- **Command Text**: ASCII command string
-- **Padding**: Space characters (0x20) to reach exactly 24 bytes total
-- **Line Ending**: CR+LF (0x0D 0x0A) after command
+Three frame subtypes:
 
-### Command Categories
-
-#### 1. PINFO (Printer Information)
-Read-only commands for querying printer status:
+#### 1. Non-data commands (32 bytes, no payload)
 ```
-PINFO  FVER                 # Firmware version
-PINFO  SERIAL_NUMBER        # Serial number
-PINFO  UNIT_STATUS          # Unit status
-PINFO  DUNIT_UPD_STS        # Update status
-PINFO  MEDIA                # Media type
-PINFO  MEDIA_CLASS          # Media class
-PINFO  FREE_PBUFFER         # Free print buffer
+ESC + command_text.ljust(31) = 32 bytes
 ```
-
-#### 2. PCNTRL (Printer Control)
-Control commands for printer operations:
+Examples:
 ```
-PCNTRL PRINTER_RESET        # Reset printer
-PCNTRL START                # Start operation
-PCNTRL CANCEL               # Cancel operation
+\x1bPSTATUS                        (32 bytes)
+\x1bPFW_UPDFLASH_REWRITE           (32 bytes)
+\x1bPCNTRL PRINTER_RESET           (32 bytes)
 ```
 
-#### 3. PFW (Printer Firmware)
-Firmware update specific commands:
+#### 2. Query commands (32 bytes, response expected)
 ```
-PFW_UPDFLASH_REWRITE        # Enter firmware update mode
-PFW_UPDFLASH_PROGRAM        # Execute flash programming
-PFW_UPDDUNIT_REWRITE        # Display unit rewrite mode
-PFW_UPDDUNIT_PROGRAM        # Display unit programming
+Host -> Printer:  [32-byte command frame]
+Printer -> Host:  [8-byte ASCII length][N bytes data]
+```
+Response length field is 8 ASCII decimal digits (e.g., "00000012").
+
+Examples:
+```
+\x1bPINFO  FVER                    -> "00000012" + "DS620 04.52     "
+\x1bPTBL_RDVersion         00000000 -> "00000008" + "04520111"
+\x1bPTBL_RDCWD300_Version  00000000 -> "00000004" + "0111"
 ```
 
-#### 4. PTBL (Printer Table)
-Table/data management commands:
+#### 3. Data write commands (32-byte header + payload + trailer)
 ```
-PTBL_RDVersion              # Read firmware version
-PTBL_WTCTRLD_UPDATE         # Write control data update
-PTBL_WTCTRLD_UPDATE_CW      # Write CWD file update
-PTBL_WTCTRLD_CWE_RESET      # Reset after CWD update
-PTBL_CL                     # Cleanup command
+Header:  ESC + command_text.ljust(23) + f"{data_size:08d}" = 32 bytes
+Payload: raw binary data (chunked at 1MB on the wire)
+Trailer: struct.pack('<I', data_size) = 4 bytes little-endian
 ```
-
-#### 5. PMNT (Printer Maintenance)
-Maintenance and counter commands:
+Examples:
 ```
-PMNT_RDCOUNTER_LIFE         # Read life counter
-PMNT_RDUSB_ISERI_SET        # Read USB serial setting
+\x1bPFW_UPDFLASH_PROGRAM   02286804[firmware bytes...][4-byte LE size]
+\x1bPTBL_WTCTRLD_UPDATE_CW 00037152[CWD bytes...][4-byte LE size]
+\x1bPTBL_WTVersion         00000004[version string][4-byte LE size]
 ```
 
-### Data Transmission
+## Command Reference
 
-For commands that send data (firmware or CWD files):
-1. Send 24-byte command
-2. Send 8-digit ASCII length (e.g., "00234567")
-3. Send binary data
-
-Example:
+### PSTATUS — Printer Status
 ```
-[ESC]PTBL_WTCTRLD_UPDATE    [00234567][binary data...]
+\x1bPSTATUS                        -> 8-byte len + status code
 ```
 
-## Update Sequence
-
-### 1. Initialization
+### PINFO — Information Queries
 ```
-→ PSTATUS
-← Response
-→ PINFO  FVER
-← Current version
-```
-
-### 2. Enter Update Mode
-```
-→ PFW_UPDFLASH_REWRITE
-← ACK (LED changes to flashing green)
-```
-
-### 3. Send Firmware
-```
-→ PTBL_WTCTRLD_UPDATE
-→ [8-digit size][S-Record data]
-← Response after complete
+PINFO  FVER                  Firmware version
+PINFO  SERIAL_NUMBER         Serial number
+PINFO  UNIT_STATUS           Unit status
+PINFO  DUNIT_UPD_STS         Firmware update status (poll during flash)
+PINFO  MEDIA                 Loaded media type
+PINFO  MEDIA_CLASS           Media class
+PINFO  MEDIA_CLASS_RFID      RFID media class
+PINFO  MQTY                  Media remaining quantity
+PINFO  MQTY_DEFAULT          Initial media count
+PINFO  FREE_PBUFFER          Free print buffer count
+PINFO  SENSOR                Sensor readings
+PINFO  RESOLUTION_H          Horizontal resolution
+PINFO  RESOLUTION_V          Vertical resolution
+PINFO  RQTY                  Remaining quantity (high)
+PINFO  PANORAMA_PRINT        Panorama capability
+PINFO  CUT_MODE              Cut control status
 ```
 
-### 4. Program Flash
+### PCNTRL — Printer Control
 ```
-→ PFW_UPDFLASH_PROGRAM
-← Status
-→ PINFO  DUNIT_UPD_STS (poll until complete)
-← Status updates...
-```
-
-### 5. Update CWD Files
-For each CWD file:
-```
-→ PTBL_WTCTRLD_UPDATE_CW
-→ [8-digit size][CWD binary data]
-← Response
-```
-
-### 6. Finalize
-```
-→ PTBL_WTCTRLD_CWE_RESET
-← ACK
-→ PTBL_CL
-← ACK
-→ PCNTRL PRINTER_RESET
-← Reset complete (LED returns to solid green)
+PCNTRL PRINTER_RESET         Reset/initialize printer
+PCNTRL CANCEL                Cancel current job
+PCNTRL START                 Start printing (after image planes)
+PCNTRL CUT_PAPER     00000008  Cut paper
+PCNTRL CUTTER        00000008  Cutter mode
+PCNTRL OVERCOAT      00000008  Overcoat/laminate mode
+PCNTRL QTY           00000008  Print quantity
+PCNTRL BUFFCNTRL     00000008  Buffer/retry control
+PCNTRL RETENTION     00000008  Paper retention mode
+PCNTRL PRINTSPEED    00000008  Print speed
+PCNTRL DECURL       00000012   Decurl control
 ```
 
-## CWD File Structure
+### PFW_UPD — Firmware Update
+```
+PFW_UPDFLASH_REWRITE         Enter flash rewrite mode (LED → flashing green)
+PFW_UPDFLASH_PROGRAM         Send firmware data (data write command)
+PFW_UPDDUNIT_REWRITE         Enter dunit rewrite mode (+8b unit ID)
+PFW_UPDDUNIT_PROGRAM         Send dunit firmware data
+```
 
-CWD (Color Working Data) files contain printer configuration:
-- Fixed size: 37,152 bytes
-- Header: "DNP    " (8 bytes)
-- Followed by encrypted/compressed configuration data
+### PTBL — Table Read/Write (CWD Data)
+```
+PTBL_RDVersion       00000000  Read CWD version
+PTBL_RDCWD300_Version 00000000 Read CWD 300dpi version
+PTBL_RDCWD300_Checksum 00000000 Read CWD 300dpi checksum
+PTBL_RDCWD600_Version 00000000 Read CWD 600dpi version
+PTBL_RDCWD600_Checksum 00000000 Read CWD 600dpi checksum
+PTBL_RDCWD610_Version 00000000 Read CWD 610 version
+PTBL_RDCWD610_Checksum 00000000 Read CWD 610 checksum
 
-File naming convention:
-- PD = Photo Direct mode
-- SD = Standard Direct mode
-- 300/600/610 = DPI resolution
-- 0111 = Version number
+PTBL_WTCTRLD_UPDATE_CW       Write CWD data (data write command)
+PTBL_WTCTRLD_UPDATE          Write CWD data (fallback command)
+PTBL_WTVersion               Set CWD version string
+PTBL_CL              00000000 Clear/finalize CWD tables
+```
 
-## Error Handling
+### PMNT — Maintenance
+```
+PMNT_RDCOUNTER_LIFE          Lifetime print counter
+PMNT_RDCOUNTER_A             Counter A
+PMNT_RDCOUNTER_B             Counter B
+PMNT_RDCOUNTER_P             Counter P
+PMNT_RDCOUNTER_M             Counter M
+PMNT_RDCTRLD_CHKSUM  00000000 Global CWD checksum
+PMNT_RDUSB_ISERI_SET         USB serial number enable
+PMNT_RDSUPPORTED_MEDIA       Supported media list
+PMNT_RDSTANDBY_TIME          Standby timeout
+```
 
-- Commands may timeout (typical timeout: 5 seconds)
-- Retry failed reads up to 3 times
-- Monitor DUNIT_UPD_STS during flash programming
-- Check for ERROR/FAIL status responses
+## Firmware Update Sequence
 
-## Safety Considerations
+From `.NET` updater call sequence (decompiled via IDA strings):
 
-1. Always verify printer status before update
-2. Ensure stable power and USB connection
-3. Do not interrupt during flash programming
-4. LED indicators:
-   - Solid green: Normal operation
-   - Flashing green: Update mode
-   - Red: Error condition
+```
+1. connect_printer / checkPrinter
+     → find USB device, verify model
+
+2. GetFirmwVersion
+     → PINFO  FVER
+     → PTBL_RDVersion         00000000
+
+3. chkCWDverAndSum
+     → PTBL_RDCWD300_Version  00000000
+     → PTBL_RDCWD300_Checksum 00000000
+     → (repeat for CWD600, CWD610)
+
+4. CvSetFirmwUpdateMode
+     → PFW_UPDFLASH_REWRITE
+     (printer LED → flashing green)
+
+5. CvSetFirmwDataWrite
+     → PFW_UPDFLASH_PROGRAM + 8-digit size + S-Record data + 4-byte LE size
+     (sends firmware file as binary blob)
+
+6. waitUpdate
+     → poll PINFO  DUNIT_UPD_STS until COMPLETE/FINISH
+     (flash programming takes 1-5 minutes)
+
+7. cwdUpdate (for each CWD file)
+     → PTBL_WTCTRLD_UPDATE_CW + 8-digit size + CWD data + 4-byte LE size
+
+8. CvSetColorDataVersion
+     → PTBL_WTVersion + 8-digit size + version string + 4-byte LE size
+
+9. cwdClear / endUpdate
+     → PTBL_CL                00000000
+     → PCNTRL PRINTER_RESET
+     (printer LED → solid green)
+```
+
+## CWD Files
+
+Color Working Data — internal printer LUTs stored in flash ROM.
+
+| File | Media | DPI | Size |
+|------|-------|-----|------|
+| DS620_PD_300_0111.cwd | Premium Digital | 300 | 37,152 bytes |
+| DS620_PD_600_0111.cwd | Premium Digital | 600 | 37,152 bytes |
+| DS620_PD_610_0111.cwd | Premium Digital | 610 (low speed) | 37,152 bytes |
+| DS620_SD_300_0111.cwd | Standard Digital | 300 | 37,152 bytes |
+| DS620_SD_600_0111.cwd | Standard Digital | 600 | 37,152 bytes |
+| DS620_SD_610_0111.cwd | Standard Digital | 610 (low speed) | 37,152 bytes |
+
+Header: `DNP    \x00` (8 bytes), followed by encrypted LUT data.
+
+## Image Print Protocol (Reference)
+
+For printing (not firmware update), the wire sequence is:
+
+```
+1. Poll PINFO  FREE_PBUFFER until buffer available
+2. For each color plane (Y, M, C):
+     PIMAGE YPLANE + 8-digit size + 1088-byte BMP header + pixel data
+3. PCNTRL START
+```
+
+BMP header: 1088 bytes (0x440), signature 0x4D42, pixel offset 1088.
+Image data sent as raw RGB, separated into YMC planes by host driver.

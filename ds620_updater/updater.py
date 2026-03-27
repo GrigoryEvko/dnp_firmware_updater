@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
 """
 DS620A Firmware Updater for Linux
-Based on reverse engineering of DNP DS620A firmware update protocol
+Protocol reverse-engineered from cspstat64.dll and CSJCX2lm.dll via IDA Pro decompilation.
+
+Wire format (from cspstat64.dll sprintf_s calls):
+  - All command frames are exactly 32 bytes: ESC (0x1B) + 31 ASCII chars, space-padded
+  - Query response: 8-byte ASCII decimal length + N bytes data
+  - Data write: 32-byte header (ESC + cmd[23] + size[8]) + payload + 4-byte LE size trailer
+  - NO CRLF termination on commands
+
+USB access: bulk OUT + bulk IN endpoints on printer class interface.
 """
 
 import sys
 import os
 import time
+import struct
 import argparse
 import logging
 import subprocess
@@ -22,28 +31,78 @@ except ImportError:
     print("Error: pyusb not installed. Please run: pip install pyusb")
     sys.exit(1)
 
-# USB Device IDs for DS620A
-DNP_VENDOR_IDS = [0x1343, 0x1452]  # DNP and alternate vendor ID
-PRODUCT_IDS = {
-    0x1343: [0x0001, 0x0002, 0x0003, 0x0004, 0x0005, 0x0006, 0x0007, 0x0008, 0x0009, 0x1001, 0xFFFF],
-    0x1452: [0x8b01, 0x8b02, 0x9001, 0x9201, 0x9301, 0x9401]
+# USB Device IDs (from cspstat64.dll SetupDi enumeration strings)
+# DS620/CX-02 use vendor 0x1452, older DNP models use 0x1343
+DEVICE_TABLE = {
+    (0x1452, 0x8b01): "DS620",
+    (0x1452, 0x8b02): "DS620 (alt)",
+    (0x1452, 0x9001): "DS820",
+    (0x1452, 0x9201): "DS820 (alt)",
+    (0x1452, 0x9301): "DS820 (v3)",
+    (0x1452, 0x9401): "DS820DX",
+    (0x1343, 0x0003): "DS40",
+    (0x1343, 0x0004): "DS80",
+    (0x1343, 0x0005): "DS-RX1",
+    (0x1343, 0x0006): "CW-02",
+    (0x1343, 0x0007): "DP-TC",
+    (0x1343, 0x0008): "DS80DUP",
+    (0x1343, 0xFFFF): "QW410",
+    (0x1343, 0x1001): "DI-RS1",
 }
 
-# Protocol constants
-ESC = 0x1B  # Control character
-CR = 0x0D   # Carriage return
-LF = 0x0A   # Line feed
-CRLF = bytes([CR, LF])
+# Protocol constants (from cspstat64.dll)
+ESC = 0x1B
+FRAME_SIZE = 32          # Every command frame is exactly 32 bytes
+CMD_FIELD_SIZE = 23      # Command text portion in data frames (before 8-byte size)
+FULL_CMD_SIZE = 31       # Command text portion in non-data frames (ESC + 31 = 32)
+SIZE_FIELD_LEN = 8       # ASCII decimal size field length
+CHUNK_SIZE = 0x100000    # 1 MB — max WriteFile chunk in cspstat64.dll sub_180017160
 
-# Timing constants (milliseconds)
-WAIT_1000MS = 1.0
-WAIT_2000MS = 2.0
-WAIT_CHMODE = 0.5
-WAIT_UPDATE = 3.0
-PRG_UPDATE_WAIT = 5.0
+# Timing (from .NET updater: WAIT_CHKSTS=2000, WAIT_CHMODE=4000, WAIT_UPDATE=15000)
+TIMEOUT_DEFAULT = 5000   # 5 seconds for normal commands
+TIMEOUT_UPDATE = 30000   # 30 seconds for firmware update operations
+TIMEOUT_FLASH = 120000   # 2 minutes for flash programming
+WAIT_CHMODE = 4.0        # Seconds to wait after entering update mode
+WAIT_POST_TRANSFER = 15.0  # Seconds to wait after firmware transfer before polling
+WAIT_POLL_INTERVAL = 2.0   # Seconds between status polls
+MODE_RETRY_COUNT = 30    # Max retries waiting for FLSHPROG_IDLE (30 × 1s = 30s)
+UPDATE_RETRY_COUNT = 90  # Max retries waiting for flash complete (90 × 2s = 3min)
+
+# Printer status codes (from CspStat.cs constants)
+CVS_USUALLY_IDLE = 0x10001
+CVS_USUALLY_PAPER_END = 0x10008
+CVS_USUALLY_RIBBON_END = 0x10010
+CVS_FLSHPROG_IDLE = 0x100001
+CVS_FLSHPROG_WRITING = 0x100002
+CVS_FLSHPROG_FINISHED = 0x100004
+CVS_FLSHPROG_DATA_ERR1 = 0x100008
+CVS_FLSHPROG_DEVICE_ERR1 = 0x100010
+CVSTATUS_ERROR = -0x80000000
+
+
+def _build_frame(cmd_text: str) -> bytes:
+    """Build 32-byte command frame for non-data commands.
+
+    Format: ESC + cmd_text padded to 31 chars with spaces = 32 bytes total.
+    Used for: PSTATUS, PINFO queries, PCNTRL commands, PFW_UPDFLASH_REWRITE, etc.
+    """
+    return bytes([ESC]) + cmd_text.encode('ascii').ljust(FULL_CMD_SIZE)
+
+
+def _build_data_frame(cmd_text: str, data_len: int) -> bytes:
+    """Build 32-byte header for data write commands.
+
+    Format: ESC + cmd_text[23 chars, space-padded] + 8-digit ASCII size = 32 bytes.
+    Followed by: payload bytes + 4-byte LE integer size trailer.
+    Used for: PFW_UPDFLASH_PROGRAM, PTBL_WTCTRLD_UPDATE_CW, PTBL_WTVersion, etc.
+    """
+    cmd_part = cmd_text.encode('ascii').ljust(CMD_FIELD_SIZE)
+    size_part = f"{data_len:08d}".encode('ascii')
+    return bytes([ESC]) + cmd_part + size_part
+
 
 class DS620Updater:
-    def __init__(self, firmware_path, cwd_dir, log_file=None):
+    def __init__(self, firmware_path: str, cwd_dir: str, log_file: str = None):
         self.firmware_path = Path(firmware_path)
         self.cwd_dir = Path(cwd_dir)
         self.device = None
@@ -52,1093 +111,733 @@ class DS620Updater:
         self.cups_was_running = False
         self.update_in_progress = False
         self.start_time = datetime.now()
-        
-        # Setup logging
         self.setup_logging(log_file)
-        
-        # Setup signal handlers
         self.setup_signal_handlers()
-        
-    def setup_logging(self, log_file):
-        """Setup logging to both console and file"""
+
+    # ── Logging & lifecycle ──────────────────────────────────────────────
+
+    def setup_logging(self, log_file: str):
         self.logger = logging.getLogger(__name__)
         self.logger.setLevel(logging.DEBUG if log_file else logging.INFO)
-        
-        # Console handler
-        console_handler = logging.StreamHandler()
-        console_handler.setLevel(logging.getLogger().level)
-        console_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-        console_handler.setFormatter(console_formatter)
-        self.logger.addHandler(console_handler)
-        
-        # File handler if requested
+
+        console = logging.StreamHandler()
+        console.setLevel(logging.getLogger().level)
+        console.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        self.logger.addHandler(console)
+
         if log_file:
-            file_handler = logging.FileHandler(log_file)
-            file_handler.setLevel(logging.DEBUG)
-            file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(funcName)s - %(message)s')
-            file_handler.setFormatter(file_formatter)
-            self.logger.addHandler(file_handler)
-            self.logger.info(f"Logging to file: {log_file}")
-            
+            fh = logging.FileHandler(log_file)
+            fh.setLevel(logging.DEBUG)
+            fh.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(funcName)s - %(message)s'))
+            self.logger.addHandler(fh)
+
     def setup_signal_handlers(self):
-        """Setup signal handlers for clean shutdown"""
-        signal.signal(signal.SIGINT, self.signal_handler)
-        signal.signal(signal.SIGTERM, self.signal_handler)
+        signal.signal(signal.SIGINT, self._on_signal)
+        signal.signal(signal.SIGTERM, self._on_signal)
         atexit.register(self.cleanup)
-        
-    def signal_handler(self, signum, frame):
-        """Handle Ctrl+C and termination signals"""
-        self.logger.warning("\n\nReceived interrupt signal!")
+
+    def _on_signal(self, signum, frame):
+        self.logger.warning("\nReceived interrupt signal!")
         if self.update_in_progress:
-            self.logger.error("WARNING: Update in progress! Interrupting now may damage the printer!")
-            self.logger.error("Press Ctrl+C again within 5 seconds to force quit...")
-            
-            # Give user a chance to reconsider
-            signal.signal(signal.SIGINT, self.force_quit)
+            self.logger.error("UPDATE IN PROGRESS — interrupting may BRICK the printer!")
+            self.logger.error("Press Ctrl+C again within 5s to force quit...")
+            signal.signal(signal.SIGINT, lambda s, f: (self.cleanup(), sys.exit(1)))
             time.sleep(5)
-            signal.signal(signal.SIGINT, self.signal_handler)
+            signal.signal(signal.SIGINT, self._on_signal)
         else:
             self.cleanup()
             sys.exit(1)
-            
-    def force_quit(self, signum, frame):
-        """Force quit on second Ctrl+C"""
-        self.logger.error("FORCE QUIT - Update interrupted!")
-        self.cleanup()
-        sys.exit(1)
-        
+
     def cleanup(self):
-        """Clean up resources and restore CUPS if needed"""
         self.logger.info("Cleaning up...")
-        
-        # Release USB resources
         if self.device:
             try:
                 usb.util.dispose_resources(self.device)
-                self.logger.debug("USB resources released")
-            except:
+            except Exception:
                 pass
-                
-        # Restart CUPS if we stopped it
         if self.cups_was_running:
             self.logger.info("Restarting CUPS service...")
             try:
-                subprocess.run(['sudo', 'systemctl', 'start', 'cups'], 
-                             capture_output=True, check=True)
-                self.logger.info("CUPS service restarted")
+                subprocess.run(['sudo', 'systemctl', 'start', 'cups'],
+                               capture_output=True, check=True)
+                self.logger.info("CUPS restarted")
             except Exception as e:
                 self.logger.error(f"Failed to restart CUPS: {e}")
-                self.logger.error("Please run: sudo systemctl start cups")
-        
-    def check_cups_status(self):
-        """Check if CUPS is running and has claimed the printer"""
+                self.logger.error("Run manually: sudo systemctl start cups")
+
+    # ── USB discovery & setup ────────────────────────────────────────────
+
+    def find_printer(self) -> bool:
+        """Find DS620/CX-02 printer via USB, checking all known VID/PID pairs."""
+        cups_running, printer_in_cups, cups_name = self._check_cups()
+
+        if printer_in_cups:
+            self.logger.warning("=" * 60)
+            self.logger.warning("DS620/CX-02 is configured in CUPS — may block USB access.")
+            self.logger.warning(f"  sudo systemctl stop cups")
+            if cups_name:
+                self.logger.warning(f"  sudo lpadmin -x {cups_name}")
+            self.logger.warning("=" * 60)
+            if os.geteuid() != 0:
+                self.logger.error("Not running as root. Try: sudo ...")
+
+        for (vid, pid), model in DEVICE_TABLE.items():
+            self.device = usb.core.find(idVendor=vid, idProduct=pid)
+            if self.device:
+                self.logger.info(f"Found {model}: VID=0x{vid:04x} PID=0x{pid:04x}")
+                self.vendor_id = vid
+                self.product_id = pid
+                self.model_name = model
+                return True
+
+        self.logger.error("Printer not found. Checked VIDs: 0x1452 (DS620/CX-02), 0x1343 (DNP legacy)")
+        if cups_running:
+            self.logger.error("CUPS is running and may be claiming the device. Try: sudo systemctl stop cups")
+        return False
+
+    def _check_cups(self):
         cups_running = False
         printer_in_cups = False
-        cups_printer_name = None
-        
+        cups_name = None
         try:
-            # Check if CUPS is running
-            result = subprocess.run(['systemctl', 'is-active', 'cups'], 
-                                  capture_output=True, text=True)
-            cups_running = result.stdout.strip() == 'active'
-            
+            r = subprocess.run(['systemctl', 'is-active', 'cups'], capture_output=True, text=True)
+            cups_running = r.stdout.strip() == 'active'
             if cups_running:
-                # Check if DS620 is configured in CUPS
-                result = subprocess.run(['lpstat', '-v'], 
-                                      capture_output=True, text=True)
-                for line in result.stdout.split('\n'):
-                    if 'dnp-ds620' in line.lower() or 'ds620' in line.lower():
+                r = subprocess.run(['lpstat', '-v'], capture_output=True, text=True)
+                for line in r.stdout.split('\n'):
+                    if any(k in line.lower() for k in ['ds620', 'cx-02', 'dnp', 'citizen']):
                         printer_in_cups = True
-                        # Extract printer name
                         if line.startswith('device for '):
-                            cups_printer_name = line.split(':')[0].replace('device for ', '')
-                        self.logger.warning(f"DS620 is configured in CUPS: {line}")
-                        
-        except Exception as e:
-            self.logger.debug(f"Could not check CUPS status: {e}")
-            
-        return cups_running, printer_in_cups, cups_printer_name
-    
-    def find_printer(self):
-        """Find DS620A printer via USB"""
-        # Check CUPS status first
-        cups_running, printer_in_cups, cups_printer_name = self.check_cups_status()
-        
-        if printer_in_cups:
-            self.logger.warning("="*60)
-            self.logger.warning("WARNING: DS620 printer is configured in CUPS!")
-            self.logger.warning("This may prevent direct USB access.")
-            self.logger.warning("")
-            self.logger.warning("Options to fix this:")
-            self.logger.warning("1. Temporarily stop CUPS: sudo systemctl stop cups")
-            self.logger.warning(f"2. Remove printer from CUPS: sudo lpadmin -x {cups_printer_name}")
-            self.logger.warning("3. Run this updater with sudo")
-            self.logger.warning("")
-            self.logger.warning("After update, restart CUPS: sudo systemctl start cups")
-            self.logger.warning("="*60)
-            
-            # Check if we're running as root
-            if os.geteuid() != 0:
-                self.logger.error("Not running as root. CUPS may block USB access.")
-                self.logger.error("Try running with sudo.")
-        
-        for vid in DNP_VENDOR_IDS:
-            for pid in PRODUCT_IDS.get(vid, []):
-                self.device = usb.core.find(idVendor=vid, idProduct=pid)
-                if self.device:
-                    self.logger.info(f"Found DS620A printer: VID={hex(vid)}, PID={hex(pid)}")
-                    self.vendor_id = vid
-                    self.product_id = pid
-                    return True
-        
-        self.logger.error("DS620A printer not found. Please ensure it's connected via USB.")
-        self.logger.error("Looking for VID:PID combinations: 1343:xxxx and 1452:xxxx")
-        
-        if cups_running:
-            self.logger.error("")
-            self.logger.error("CUPS is running and may be blocking USB access.")
-            self.logger.error("Try: sudo systemctl stop cups")
-            
-        return False
-        
-    def unbind_usblp(self):
-        """Unbind usblp driver from printer device"""
+                            cups_name = line.split(':')[0].replace('device for ', '')
+        except Exception:
+            pass
+        return cups_running, printer_in_cups, cups_name
+
+    def setup_usb(self) -> bool:
+        """Detach kernel driver, claim interface, find bulk endpoints."""
         try:
-            # Get device bus and address
-            bus = self.device.bus
-            address = self.device.address
-            
-            self.logger.info(f"Attempting to unbind usblp driver from bus {bus}, device {address}")
-            
-            # Method 1: Try direct unbind using lsusb output format
-            # The interface is typically bus-port:config.interface (e.g., "1-4:1.0")
-            import subprocess
-            
-            # Get the device path from lsusb
-            result = subprocess.run(
-                ["lsusb", "-t"],
-                capture_output=True,
-                text=True
-            )
-            
-            if self.logger.level == logging.DEBUG:
-                self.logger.debug(f"lsusb -t output:\n{result.stdout}")
-            
-            # Method 2: Find the correct sysfs path
-            # USB devices in sysfs follow pattern: /sys/bus/usb/devices/busnum-port[.port...]
-            sysfs_base = "/sys/bus/usb/devices/"
-            
-            # Try to find files that match our bus
-            try:
-                import glob
-                # Look for all devices on this bus
-                for device_path in glob.glob(f"{sysfs_base}{bus}-*"):
-                    if not os.path.isdir(device_path):
-                        continue
-                        
-                    # Check if this is our device by reading devnum
-                    try:
-                        devnum_path = os.path.join(device_path, "devnum")
-                        if os.path.exists(devnum_path):
-                            with open(devnum_path, 'r') as f:
-                                devnum = int(f.read().strip())
-                                
-                            if devnum == address:
-                                # Found our device! Now try to unbind usblp
-                                self.logger.info(f"Found device at {device_path}")
-                                
-                                # The interface is typically :1.0 for first interface
-                                interface_name = os.path.basename(device_path) + ":1.0"
-                                unbind_path = "/sys/bus/usb/drivers/usblp/unbind"
-                                
-                                if os.path.exists(unbind_path):
-                                    self.logger.info(f"Unbinding usblp from interface {interface_name}")
-                                    try:
-                                        with open(unbind_path, 'w') as f:
-                                            f.write(interface_name + "\n")
-                                        self.logger.info("Successfully unbound usblp driver")
-                                        time.sleep(0.5)  # Give system time to release
-                                        return True
-                                    except IOError as e:
-                                        if "No such device" in str(e):
-                                            self.logger.info("Device not bound to usblp (already unbound?)")
-                                            return True
-                                        else:
-                                            self.logger.warning(f"Failed to write to unbind: {e}")
-                                else:
-                                    self.logger.warning("usblp unbind path not found - driver might not be loaded")
-                                    return True  # Not an error if usblp isn't loaded
-                                    
-                    except Exception as e:
-                        self.logger.debug(f"Error checking {device_path}: {e}")
-                        continue
-                        
-            except Exception as e:
-                self.logger.warning(f"Error searching sysfs: {e}")
-                
-            # If we get here, we couldn't find the device
-            self.logger.warning("Could not find device in sysfs - attempting to continue anyway")
-            return True  # Try to continue even if unbind failed
-            
-        except Exception as e:
-            self.logger.warning(f"Failed to unbind usblp: {e}")
-            return True  # Try to continue even if unbind failed
-    
-    def setup_usb(self):
-        """Setup USB communication endpoints"""
-        try:
-            # Try to unbind usblp driver first
-            self.unbind_usblp()
-            
-            # Detach kernel driver if active
+            self._unbind_usblp()
+
             if self.device.is_kernel_driver_active(0):
                 self.device.detach_kernel_driver(0)
-                
-            # Set configuration
+
             self.device.set_configuration()
-            
-            # Get configuration
             cfg = self.device.get_active_configuration()
-            intf = cfg[(0,0)]
-            
-            # Find endpoints
+            intf = cfg[(0, 0)]
+
             self.ep_out = usb.util.find_descriptor(
-                intf,
-                custom_match = lambda e: usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT
-            )
-            
+                intf, custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT)
             self.ep_in = usb.util.find_descriptor(
-                intf,
-                custom_match = lambda e: usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_IN
-            )
-            
+                intf, custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_IN)
+
             if not self.ep_out or not self.ep_in:
-                raise Exception("Could not find USB endpoints")
-                
-            self.logger.info("USB communication established")
-            
-            if self.logger.level == logging.DEBUG:
-                self.logger.debug(f"OUT endpoint: 0x{self.ep_out.bEndpointAddress:02x}")
-                self.logger.debug(f"IN endpoint: 0x{self.ep_in.bEndpointAddress:02x}")
-                self.logger.debug(f"Device: {self.device}")
-                self.logger.debug(f"Configuration: {cfg}")
-            
-            # Clear any pending data
-            self.clear_usb_buffers()
-            
-            # Run diagnostics if in debug mode
-            if self.logger.level == logging.DEBUG:
-                self.diagnose_usb()
-            
-            # Initialize printer communication
-            self.initialize_printer()
-            
+                raise RuntimeError("Could not find USB bulk endpoints")
+
+            self.logger.info(f"USB OK: OUT=0x{self.ep_out.bEndpointAddress:02x} IN=0x{self.ep_in.bEndpointAddress:02x}")
+            self._drain_input()
             return True
-            
         except Exception as e:
             self.logger.error(f"USB setup failed: {e}")
             return False
-            
-    def clear_usb_buffers(self):
-        """Clear any pending data from USB buffers"""
-        if self.logger.level == logging.DEBUG:
-            self.logger.debug("Clearing USB buffers...")
-        
+
+    def _unbind_usblp(self):
+        """Unbind usblp kernel driver from the printer interface."""
+        import glob
+        bus, addr = self.device.bus, self.device.address
+        sysfs = "/sys/bus/usb/devices/"
+        for devpath in glob.glob(f"{sysfs}{bus}-*"):
+            if not os.path.isdir(devpath):
+                continue
+            try:
+                devnum_file = os.path.join(devpath, "devnum")
+                if os.path.exists(devnum_file):
+                    with open(devnum_file) as f:
+                        if int(f.read().strip()) == addr:
+                            iface = os.path.basename(devpath) + ":1.0"
+                            unbind = "/sys/bus/usb/drivers/usblp/unbind"
+                            if os.path.exists(unbind):
+                                with open(unbind, 'w') as uf:
+                                    uf.write(iface + "\n")
+                                self.logger.info(f"Unbound usblp from {iface}")
+                                time.sleep(0.5)
+                            return
+            except Exception:
+                continue
+
+    def _drain_input(self):
+        """Drain any stale data from the IN endpoint."""
         try:
             while True:
-                data = self.ep_in.read(1024, timeout=100)
-                if self.logger.level == logging.DEBUG:
-                    self.logger.debug(f"Cleared {len(data)} bytes from input buffer")
+                self.ep_in.read(1024, timeout=100)
         except usb.core.USBTimeoutError:
-            # No more data to read
             pass
-            
-    def diagnose_usb(self):
-        """Print detailed USB device information for debugging"""
-        self.logger.debug("=== USB Device Diagnostics ===")
+
+    # ── Wire protocol primitives ─────────────────────────────────────────
+    # Based on cspstat64.dll: sub_180017620 (query), sub_180017870 (write)
+
+    def send_command(self, cmd_text: str):
+        """Send a 32-byte command frame (no data, no response expected).
+
+        Used for: PFW_UPDFLASH_REWRITE, PCNTRL PRINTER_RESET, etc.
+        """
+        frame = _build_frame(cmd_text)
+        assert len(frame) == FRAME_SIZE, f"Frame size {len(frame)} != {FRAME_SIZE}"
+        self.logger.debug(f"CMD> {cmd_text!r}  [{frame.hex()}]")
+        self.ep_out.write(frame)
+
+    def query_command(self, cmd_text: str, timeout: int = TIMEOUT_DEFAULT) -> bytes:
+        """Send 32-byte command, read 8-byte ASCII length + data response.
+
+        Protocol (cspstat64.dll sub_180017620):
+          Host -> Printer: [32-byte frame]
+          Printer -> Host: [8-byte ASCII length][N bytes data]
+        """
+        frame = _build_frame(cmd_text)
+        assert len(frame) == FRAME_SIZE
+        self.logger.debug(f"QRY> {cmd_text!r}")
+        self.ep_out.write(frame)
+
         try:
-            self.logger.debug(f"Vendor: 0x{self.device.idVendor:04x}")
-            self.logger.debug(f"Product: 0x{self.device.idProduct:04x}")
-            
-            # Try to get device strings
-            try:
-                manufacturer = usb.util.get_string(self.device, self.device.iManufacturer)
-                self.logger.debug(f"Manufacturer: {manufacturer}")
-            except:
-                self.logger.debug("Manufacturer: (unable to read)")
-                
-            try:
-                product = usb.util.get_string(self.device, self.device.iProduct)
-                self.logger.debug(f"Product Name: {product}")
-            except:
-                self.logger.debug("Product Name: (unable to read)")
-                
-            try:
-                serial = usb.util.get_string(self.device, self.device.iSerialNumber)
-                self.logger.debug(f"Serial: {serial}")
-            except:
-                self.logger.debug("Serial: (unable to read)")
-            
-            # List all configurations and interfaces
-            for cfg in self.device:
-                self.logger.debug(f"\nConfiguration {cfg.bConfigurationValue}:")
-                for intf in cfg:
-                    self.logger.debug(f"  Interface {intf.bInterfaceNumber}, Alt {intf.bAlternateSetting}:")
-                    self.logger.debug(f"    Class: 0x{intf.bInterfaceClass:02x} (0x07=Printer)")
-                    self.logger.debug(f"    Subclass: 0x{intf.bInterfaceSubClass:02x}")
-                    self.logger.debug(f"    Protocol: 0x{intf.bInterfaceProtocol:02x}")
-                    
-                    for ep in intf:
-                        direction = "IN" if ep.bEndpointAddress & 0x80 else "OUT"
-                        ep_type = ["Control", "Isochronous", "Bulk", "Interrupt"][ep.bmAttributes & 0x03]
-                        self.logger.debug(f"    Endpoint 0x{ep.bEndpointAddress:02x}: {direction} {ep_type}, MaxPacket={ep.wMaxPacketSize}")
-                        
-        except Exception as e:
-            self.logger.debug(f"Error during USB diagnostics: {e}")
-            
-    def test_raw_usb(self):
-        """Test raw USB communication for debugging"""
-        self.logger.debug("=== Testing Raw USB Communication ===")
-        
-        # Test 1: Single byte write
-        try:
-            self.ep_out.write(b'\x1b')
-            self.logger.debug("✓ Successfully wrote single ESC byte")
-        except Exception as e:
-            self.logger.debug(f"✗ Failed to write single byte: {e}")
-            
-        # Test 2: Simple string
-        try:
-            self.ep_out.write(b'PSTATUS\r\n')
-            self.logger.debug("✓ Successfully wrote simple command")
-        except Exception as e:
-            self.logger.debug(f"✗ Failed to write simple command: {e}")
-            
-        # Test 3: Try to read any response
-        try:
-            data = self.ep_in.read(64, timeout=1000)
-            self.logger.debug(f"✓ Read {len(data)} bytes: {data.hex()}")
+            # Read 8-byte ASCII length prefix
+            raw_len = bytes(self.ep_in.read(SIZE_FIELD_LEN, timeout=timeout))
+            length = int(raw_len.decode('ascii').strip())
+            self.logger.debug(f"  response length: {length} (raw: {raw_len!r})")
+
+            if length <= 0:
+                return b''
+
+            # Read exactly N bytes of response data
+            data = bytes(self.ep_in.read(length, timeout=timeout))
+            self.logger.debug(f"  response data: {data!r}")
+            return data
+
         except usb.core.USBTimeoutError:
-            self.logger.debug("✗ No data available to read (timeout)")
-        except Exception as e:
-            self.logger.debug(f"✗ Read error: {e}")
-            
-    def send_printer_class_request(self):
-        """Send USB printer class-specific requests"""
+            self.logger.debug(f"  timeout (no response)")
+            return None
+        except (ValueError, UnicodeDecodeError) as e:
+            self.logger.debug(f"  parse error: {e}")
+            return None
+
+    def send_data_command(self, cmd_text: str, data: bytes, timeout: int = TIMEOUT_UPDATE):
+        """Send command with payload: [32-byte header][data chunks][4-byte LE size trailer].
+
+        Protocol (cspstat64.dll sub_180017870 / SetFirmwDataWrite):
+          Block 0: ESC + cmd_text[23 chars] + 8-digit ASCII size = 32 bytes
+          Block 1: payload data (chunked at 1MB)
+          Block 2: 4-byte little-endian integer size
+        """
+        header = _build_data_frame(cmd_text, len(data))
+        assert len(header) == FRAME_SIZE, f"Data header size {len(header)} != {FRAME_SIZE}"
+        trailer = struct.pack('<I', len(data))
+
+        self.logger.debug(f"DAT> {cmd_text!r}  size={len(data)}  [{header.hex()}]")
+
+        # Send 32-byte header
+        self.ep_out.write(header)
+
+        # Send payload in 1MB chunks (cspstat64.dll sub_180017160 chunk limit)
+        total_sent = 0
+        t0 = time.time()
+        while total_sent < len(data):
+            chunk = data[total_sent:total_sent + CHUNK_SIZE]
+            self.ep_out.write(chunk)
+            total_sent += len(chunk)
+
+            elapsed = time.time() - t0
+            if elapsed > 0 and total_sent < len(data):
+                pct = total_sent / len(data) * 100
+                rate = total_sent / elapsed / 1024
+                eta = (len(data) - total_sent) / (total_sent / elapsed)
+                self.logger.info(f"  {pct:.0f}%  {total_sent // 1024}K / {len(data) // 1024}K  "
+                                 f"{rate:.0f} KB/s  ETA {eta:.0f}s")
+
+        # Send 4-byte LE size trailer (cspstat64.dll Block 3)
+        self.ep_out.write(trailer)
+
+        elapsed = time.time() - t0
+        self.logger.info(f"  Sent {len(data)} bytes in {elapsed:.1f}s ({len(data) / elapsed / 1024:.0f} KB/s)")
+
+        # Read optional response
         try:
-            # USB Printer Class requests
-            GET_DEVICE_ID = 0x00
-            GET_PORT_STATUS = 0x01
-            SOFT_RESET = 0x02
-            
-            # Get device ID (IEEE 1284 Device ID)
-            self.logger.info("Sending GET_DEVICE_ID request...")
-            try:
-                # bmRequestType: 0xA1 (Device to Host, Class, Interface)
-                # bRequest: 0x00 (GET_DEVICE_ID)
-                # wValue: 0
-                # wIndex: Interface number (0)
-                # wLength: 1024 (max expected response)
-                device_id = self.device.ctrl_transfer(0xA1, GET_DEVICE_ID, 0, 0, 1024, timeout=1000)
-                if device_id and len(device_id) > 2:
-                    # First two bytes are length (big-endian)
-                    id_len = (device_id[0] << 8) | device_id[1]
-                    id_string = device_id[2:2+id_len].decode('ascii', errors='ignore')
-                    self.logger.info(f"Device ID: {id_string}")
-            except Exception as e:
-                self.logger.debug(f"GET_DEVICE_ID failed: {e}")
-            
-            # Get port status
-            try:
-                # wLength: 1 (status byte)
-                status = self.device.ctrl_transfer(0xA1, GET_PORT_STATUS, 0, 0, 1, timeout=1000)
-                if status:
-                    self.logger.info(f"Port status: 0x{status[0]:02x}")
-                    # Bit 5: Paper Empty
-                    # Bit 4: Select
-                    # Bit 3: Not Error
-                    if status[0] & 0x20:
-                        self.logger.warning("Paper empty detected")
-            except Exception as e:
-                self.logger.debug(f"GET_PORT_STATUS failed: {e}")
-                
-            # Try soft reset for 0x1452 devices
-            if self.vendor_id == 0x1452:
-                self.logger.info("Sending SOFT_RESET for vendor 0x1452...")
-                try:
-                    # bmRequestType: 0x21 (Host to Device, Class, Interface)
-                    # No data phase
-                    self.device.ctrl_transfer(0x21, SOFT_RESET, 0, 0, timeout=1000)
-                    time.sleep(0.5)  # Give device time to reset
-                    self.logger.info("Soft reset completed")
-                except Exception as e:
-                    self.logger.debug(f"SOFT_RESET failed: {e}")
-                    
-        except Exception as e:
-            self.logger.warning(f"Printer class requests failed: {e}")
-    
-    def initialize_printer(self):
-        """Initialize printer communication"""
-        self.logger.info("Initializing printer communication...")
-        
-        # Send USB printer class requests first
-        self.send_printer_class_request()
-        
-        # Run raw USB test in debug mode
-        if self.logger.level == logging.DEBUG:
-            self.test_raw_usb()
-        
-        # Special handling for vendor 0x1452
-        if hasattr(self, 'vendor_id') and self.vendor_id == 0x1452:
-            self.logger.info("Using initialization for vendor 0x1452")
-            # Try longer timeout and different delays
-            timeout = 10000  # 10 seconds
-            
-            # Add extra delay after USB setup for 0x1452
-            time.sleep(1.0)
-            
-            if self.logger.level == logging.DEBUG:
-                self.logger.debug("Added 1 second delay for VID 0x1452 initialization")
-        else:
-            timeout = 5000  # 5 seconds
-        
-        # Send STATUS command to verify communication
-        self.send_command("PSTATUS")
-        time.sleep(0.5)
-        response = self.read_response(timeout=timeout)
-        
-        if response:
-            self.logger.info("Printer communication initialized")
-            if self.logger.level == logging.DEBUG:
-                self.logger.debug(f"STATUS response: {response.decode('ascii', errors='replace')}")
-                self.logger.debug(f"Response hex: {response.hex()}")
-        else:
-            self.logger.warning("No response to STATUS command, continuing anyway...")
-            
-    def send_command(self, command, data=None):
-        """Send command to printer"""
-        # Use standard DNP format for all vendors
-        cmd_bytes = bytes([ESC]) + command.encode('ascii')
-        
-        # Ensure command is exactly 23 bytes (24 total with ESC)
-        if len(cmd_bytes) < 24:
-            cmd_bytes += b' ' * (24 - len(cmd_bytes))
-        
-        if data:
-            cmd_bytes += data
-        cmd_bytes += CRLF
-        
-        # Enhanced debug logging
-        if self.logger.level == logging.DEBUG:
-            self.logger.debug(f"Sending command: {command}")
-            self.logger.debug(f"Raw hex: {cmd_bytes.hex()}")
-            self.logger.debug(f"ASCII: {cmd_bytes.decode('ascii', errors='replace')}")
-            self.logger.debug(f"Total length: {len(cmd_bytes)} bytes")
-            
-            # Special debugging for 0x1452
-            if hasattr(self, 'vendor_id') and self.vendor_id == 0x1452:
-                self.logger.debug(f"VID 0x1452: Using standard DNP format")
-        
+            resp_len = bytes(self.ep_in.read(SIZE_FIELD_LEN, timeout=timeout))
+            length = int(resp_len.decode('ascii').strip())
+            if length > 0:
+                resp = bytes(self.ep_in.read(length, timeout=timeout))
+                self.logger.debug(f"  response: {resp!r}")
+                return resp
+            return b''
+        except (usb.core.USBTimeoutError, ValueError):
+            return None
+
+    # ── Printer info queries ─────────────────────────────────────────────
+
+    def get_device_id(self):
+        """Read IEEE 1284 Device ID via USB printer class control transfer."""
         try:
-            bytes_written = self.ep_out.write(cmd_bytes)
-            if self.logger.level == logging.DEBUG:
-                self.logger.debug(f"Wrote {bytes_written} bytes to endpoint 0x{self.ep_out.bEndpointAddress:02x}")
+            data = self.device.ctrl_transfer(0xA1, 0x00, 0, 0, 1024, timeout=1000)
+            if data and len(data) > 2:
+                id_len = (data[0] << 8) | data[1]
+                id_str = data[2:2 + id_len].decode('ascii', errors='ignore')
+                self.logger.info(f"Device ID: {id_str}")
+                return id_str
         except Exception as e:
-            self.logger.error(f"Failed to write to USB: {e}")
-            raise
-        
-    def read_response(self, timeout=5000, retry_count=3):
-        """Read response from printer with retry logic"""
-        for attempt in range(retry_count):
-            try:
-                # First try to read potential length field
-                initial_read = self.ep_in.read(1024, timeout)
-                response = bytes(initial_read)
-                
-                if self.logger.level == logging.DEBUG:
-                    self.logger.debug(f"Read {len(response)} bytes from endpoint 0x{self.ep_in.bEndpointAddress:02x}")
-                    self.logger.debug(f"Raw hex: {response.hex()}")
-                    self.logger.debug(f"ASCII: {response.decode('ascii', errors='replace')}")
-                    
-                    # Extra debugging for 0x1452
-                    if hasattr(self, 'vendor_id') and self.vendor_id == 0x1452:
-                        self.logger.debug(f"VID 0x1452 response analysis:")
-                        if len(response) > 0:
-                            self.logger.debug(f"  First byte: 0x{response[0]:02x}")
-                            self.logger.debug(f"  Looks like error: {'yes' if response[0] in [0x15, 0x06] else 'no'}")
-                
-                # Check if response starts with 8-digit length
-                if len(response) >= 8 and response[:8].decode('ascii', errors='ignore').isdigit():
-                    length = int(response[:8].decode('ascii'))
-                    self.logger.debug(f"Detected length-prefixed response: {length} bytes expected")
-                    
-                    # If we have the full response already
-                    if len(response) >= 8 + length:
-                        return response[8:8+length]
-                    
-                    # Otherwise, read the remaining data
-                    remaining = length - (len(response) - 8)
-                    if remaining > 0:
-                        more_data = self.ep_in.read(remaining, timeout)
-                        response += bytes(more_data)
-                        return response[8:8+length]
-                
-                # For 0x1452, log non-standard responses
-                if hasattr(self, 'vendor_id') and self.vendor_id == 0x1452 and len(response) > 0:
-                    self.logger.warning(f"VID 0x1452: Non-standard response format")
-                
-                return response
-                
-            except usb.core.USBTimeoutError:
-                if attempt < retry_count - 1:
-                    self.logger.debug(f"Read timeout, retrying... ({attempt + 1}/{retry_count})")
-                    time.sleep(0.1)
-                else:
-                    if self.logger.level == logging.DEBUG:
-                        self.logger.debug(f"Read timeout after {retry_count} attempts")
-                        if hasattr(self, 'vendor_id') and self.vendor_id == 0x1452:
-                            self.logger.debug("VID 0x1452: No response received")
-                    return None
+            self.logger.debug(f"GET_DEVICE_ID failed: {e}")
         return None
-            
+
     def get_printer_info(self):
-        """Get printer information"""
-        self.logger.info("Getting printer information...")
-        
-        # Get firmware version using PTBL_RDVersion
-        self.send_command("PTBL_RDVersion")
-        time.sleep(0.1)
-        response = self.read_response()
-        if response:
-            self.logger.info(f"Current firmware version: {response.decode('ascii', errors='ignore').strip()}")
-            
-        # Get firmware version using PINFO
-        self.send_command("PINFO  FVER")
-        time.sleep(0.1)
-        response = self.read_response()
-        if response:
-            self.logger.info(f"Current firmware (PINFO): {response.decode('ascii', errors='ignore').strip()}")
-            
-        # Get serial number
-        self.send_command("PINFO  SERIAL_NUMBER")
-        time.sleep(0.1)
-        response = self.read_response()
-        if response:
-            self.logger.info(f"Serial number: {response.decode('ascii', errors='ignore').strip()}")
-            
-        # Get unit status
-        self.send_command("PINFO  UNIT_STATUS")
-        time.sleep(0.1)
-        response = self.read_response()
-        if response:
-            self.logger.info(f"Unit status: {response.decode('ascii', errors='ignore').strip()}")
-            
+        """Query printer firmware version, serial, status."""
+        self.logger.info("Querying printer info...")
+
+        r = self.query_command("PSTATUS")
+        if r:
+            self.logger.info(f"Status: {r.decode('ascii', errors='replace').strip()}")
+
+        for cmd, label in [
+            ("PINFO  FVER",           "Firmware version"),
+            ("PINFO  SERIAL_NUMBER",  "Serial number"),
+            ("PINFO  UNIT_STATUS",    "Unit status"),
+            ("PINFO  MEDIA",          "Media type"),
+            ("PINFO  MEDIA_CLASS",    "Media class"),
+            ("PINFO  MQTY",           "Media remaining"),
+            ("PINFO  FREE_PBUFFER",   "Free print buffer"),
+        ]:
+            r = self.query_command(cmd)
+            if r:
+                self.logger.info(f"  {label}: {r.decode('ascii', errors='replace').strip()}")
+
+        # Read firmware version via PTBL path too
+        r = self.query_command("PTBL_RDVersion         00000000")
+        if r:
+            self.logger.info(f"  FW version (PTBL): {r.decode('ascii', errors='replace').strip()}")
+
     def check_cwd_versions(self):
-        """Check CWD versions before update"""
+        """Query CWD version and checksum for each resolution.
+
+        CWD IDs are 300/600/610 (from cspstat64.dll GetColorDataVersionRes).
+        """
         self.logger.info("Checking CWD versions...")
-        
-        # CWD file mappings to their IDs
-        cwd_mappings = {
-            "DS620_PD_300_0111.cwd": "001",
-            "DS620_PD_600_0111.cwd": "002", 
-            "DS620_PD_610_0111.cwd": "003",
-            "DS620_SD_300_0111.cwd": "004",
-            "DS620_SD_600_0111.cwd": "005",
-            "DS620_SD_610_0111.cwd": "006"
-        }
-        
-        for cwd_file, cwd_id in cwd_mappings.items():
-            # Check version
-            cmd = f"PTBL_RDCWD{cwd_id}_Version"
-            self.send_command(cmd)
-            time.sleep(0.1)
-            response = self.read_response()
-            if response:
-                self.logger.info(f"{cwd_file} version: {response.decode('ascii', errors='ignore').strip()}")
-                
-            # Check checksum
-            cmd = f"PTBL_RDCWD{cwd_id}_Checksum"
-            self.send_command(cmd)
-            time.sleep(0.1)
-            response = self.read_response()
-            if response:
-                self.logger.debug(f"{cwd_file} checksum: {response.decode('ascii', errors='ignore').strip()}")
-            
-    def enter_update_mode(self):
-        """Enter firmware update mode"""
-        self.logger.info("Entering firmware update mode...")
-        
-        # Send flash rewrite command
-        self.send_command("PFW_UPDFLASH_REWRITE")
-        time.sleep(WAIT_CHMODE)
-        
-        response = self.read_response(timeout=15000)  # 15 second timeout
-        if response:
-            self.logger.info("Entered update mode (LED should be flashing green)")
-            if self.logger.level == logging.DEBUG:
-                self.logger.debug(f"Update mode response: {response.hex()}")
-                self.logger.debug(f"Update mode response ASCII: {response.decode('ascii', errors='replace')}")
-            return True
-        else:
-            self.logger.error("Failed to enter update mode")
-            self.logger.error("Check if:")
-            self.logger.error("  - Printer is ready (not busy)")
-            self.logger.error("  - Cover is closed")
-            self.logger.error("  - No active print jobs")
-            self.logger.error("  - Media is loaded")
-            return False
-            
-    def send_firmware(self):
-        """Send S-Record firmware file using PTBL_WTCTRLD_UPDATE command"""
-        self.logger.info(f"Sending firmware file: {self.firmware_path}")
-        
-        try:
-            # Read entire firmware file
-            with open(self.firmware_path, 'rb') as f:
-                firmware_data = f.read()
-                
-            self.logger.info(f"Firmware size: {len(firmware_data)} bytes ({len(firmware_data)/1024/1024:.1f} MB)")
-            
-            # Send firmware update command with data length
-            # Using PTBL_WTCTRLD_UPDATE for main firmware
-            # Send command first (24 bytes)
-            self.send_command("PTBL_WTCTRLD_UPDATE")
-            time.sleep(0.1)
-            
-            # Then send length + data
-            length_bytes = f"{len(firmware_data):08d}".encode('ascii')
-            
-            # Send length followed by firmware data in chunks
-            self.ep_out.write(length_bytes)
-            
-            chunk_size = 4096
-            total_sent = 0
-            start_time = time.time()
-            last_log_time = start_time
-            
-            while total_sent < len(firmware_data):
-                chunk = firmware_data[total_sent:total_sent + chunk_size]
-                self.ep_out.write(chunk)
-                total_sent += len(chunk)
-                
-                # Progress indicator with time estimate
-                current_time = time.time()
-                if current_time - last_log_time >= 2.0:  # Log every 2 seconds
-                    progress = (total_sent / len(firmware_data)) * 100
-                    elapsed = current_time - start_time
-                    if total_sent > 0:
-                        rate = total_sent / elapsed  # bytes per second
-                        remaining_bytes = len(firmware_data) - total_sent
-                        eta = remaining_bytes / rate
-                        self.logger.info(f"Progress: {progress:.1f}% | {total_sent/1024/1024:.1f}/{len(firmware_data)/1024/1024:.1f} MB | "
-                                       f"Speed: {rate/1024:.1f} KB/s | ETA: {eta:.0f}s")
-                    else:
-                        self.logger.info(f"Progress: {progress:.1f}% ({total_sent}/{len(firmware_data)})")
-                    last_log_time = current_time
-                    
-                # Small delay between chunks
-                time.sleep(0.001)
-                
-            # Final progress
-            elapsed = time.time() - start_time
-            self.logger.info(f"Firmware transmission complete in {elapsed:.1f} seconds")
-            self.logger.info(f"Average speed: {len(firmware_data)/elapsed/1024:.1f} KB/s")
-            
-            # Wait for response
-            self.logger.info("Waiting for printer to process firmware...")
-            time.sleep(1.0)
-            response = self.read_response(timeout=10000)
-            if response:
-                self.logger.debug(f"Firmware update response: {response}")
-                
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Failed to send firmware: {e}")
-            return False
-            
-    def program_flash(self):
-        """Execute flash programming"""
-        self.logger.info("Programming flash memory...")
-        
-        # Send program command
-        self.send_command("PFW_UPDFLASH_PROGRAM")
-        
-        # Wait for programming to complete
-        self.logger.info("Waiting for flash programming to complete (this may take several minutes)...")
-        
-        # Poll update status
-        start_time = time.time()
-        timeout = 300  # 5 minutes timeout
-        
-        while time.time() - start_time < timeout:
-            # Check update status
-            self.send_command("PINFO  DUNIT_UPD_STS")
-            time.sleep(1.0)
-            response = self.read_response()
-            
-            if response:
-                status = response.decode('ascii', errors='ignore').strip()
-                self.logger.debug(f"Update status: {status}")
-                
-                if "COMPLETE" in status or "FINISH" in status:
-                    self.logger.info("Flash programming complete")
-                    return True
-                elif "ERROR" in status or "FAIL" in status:
-                    self.logger.error(f"Flash programming failed: {status}")
-                    return False
-                    
-            time.sleep(2.0)
-            
-        self.logger.error("Flash programming timed out")
-        return False
-            
-    def update_cwd_files(self):
-        """Update CWD configuration files"""
-        cwd_files = [
-            "DS620_PD_300_0111.cwd",
-            "DS620_PD_600_0111.cwd",
-            "DS620_PD_610_0111.cwd",
-            "DS620_SD_300_0111.cwd",
-            "DS620_SD_600_0111.cwd",
-            "DS620_SD_610_0111.cwd"
-        ]
-        
-        for cwd_file in cwd_files:
-            cwd_path = self.cwd_dir / cwd_file
-            if not cwd_path.exists():
-                self.logger.warning(f"CWD file not found: {cwd_file}")
-                continue
-                
-            self.logger.info(f"Updating CWD file: {cwd_file}")
-            
-            # Read CWD file
-            with open(cwd_path, 'rb') as f:
-                cwd_data = f.read()
-                
-            # Send update command first (24 bytes)
-            self.send_command("PTBL_WTCTRLD_UPDATE_CW")
-            time.sleep(0.1)
-            
-            # Then send length + CWD data
-            length_bytes = f"{len(cwd_data):08d}".encode('ascii')
-            self.ep_out.write(length_bytes + cwd_data)
-            time.sleep(WAIT_UPDATE)
-            
-            # Check response
-            response = self.read_response()
-            if response:
-                self.logger.info(f"CWD update complete: {cwd_file}")
-            else:
-                self.logger.warning(f"No response for CWD update: {cwd_file}")
-                
-    def reset_printer(self):
-        """Reset printer to complete update"""
-        self.logger.info("Resetting printer...")
-        
-        # Send CWD reset command first
-        self.send_command("PTBL_WTCTRLD_CWE_RESET")
-        time.sleep(0.5)
-        
-        # Send cleanup command
-        self.send_command("PTBL_CL")
-        time.sleep(0.5)
-        
-        # Send printer reset command
-        self.send_command("PCNTRL PRINTER_RESET")
-        time.sleep(WAIT_2000MS)
-        
-        self.logger.info("Printer reset complete (LED should return to solid green)")
-        
-    def verify_update(self):
-        """Verify firmware update was successful"""
-        self.logger.info("Verifying firmware update...")
-        
-        # Wait for printer to fully restart
-        time.sleep(5.0)
-        
-        # Get new firmware version using PTBL command
-        self.send_command("PTBL_RDVersion")
-        time.sleep(0.1)
-        response = self.read_response()
-        
-        if response:
-            new_version = response.decode('ascii', errors='ignore').strip()
-            self.logger.info(f"New firmware version: {new_version}")
-            
-            # Check if version contains "04.52"
-            if "04.52" in new_version or "0452" in new_version:
-                self.logger.info("Firmware update successful!")
-                return True
-            else:
-                self.logger.warning("Firmware version may not have updated correctly")
-                return False
-        else:
-            self.logger.error("Could not verify firmware version")
-            return False
-            
-    def dry_run(self):
-        """Perform a dry run - check printer status and versions without updating"""
-        self.logger.info("=== DRY RUN MODE - No changes will be made ===")
-        
-        try:
-            # Find and setup printer
-            if not self.find_printer():
-                return False
-                
-            if not self.setup_usb():
-                return False
-                
-            self.logger.info("\n--- Printer Information ---")
-            # Get initial printer info
-            self.get_printer_info()
-            
-            self.logger.info("\n--- Checking CWD Versions ---")
-            # Check current CWD versions
-            self.check_cwd_versions()
-            
-            self.logger.info("\n--- Firmware File Information ---")
-            # Check firmware file
-            if self.firmware_path.exists():
-                with open(self.firmware_path, 'r') as f:
-                    lines = f.readlines()
-                self.logger.info(f"Firmware file: {self.firmware_path}")
-                self.logger.info(f"S-Record lines: {len(lines)}")
-                self.logger.info(f"File size: {self.firmware_path.stat().st_size} bytes")
-                
-                # Extract version from S-Record if possible
-                for line in lines[:100]:  # Check first 100 lines
-                    if "DS620" in line and ("04.52" in line or "0452" in line):
-                        self.logger.info(f"Firmware version in file: 04.52")
-                        break
-            else:
-                self.logger.error(f"Firmware file not found: {self.firmware_path}")
-                
-            self.logger.info("\n--- CWD Files Check ---")
-            # Check CWD files
-            cwd_files = [
-                "DS620_PD_300_0111.cwd",
-                "DS620_PD_600_0111.cwd",
-                "DS620_PD_610_0111.cwd",
-                "DS620_SD_300_0111.cwd",
-                "DS620_SD_600_0111.cwd",
-                "DS620_SD_610_0111.cwd"
-            ]
-            
-            found_files = 0
-            for cwd_file in cwd_files:
-                cwd_path = self.cwd_dir / cwd_file
-                if cwd_path.exists():
-                    self.logger.info(f"✓ {cwd_file} - {cwd_path.stat().st_size} bytes")
-                    found_files += 1
-                else:
-                    self.logger.warning(f"✗ {cwd_file} - NOT FOUND")
-                    
-            self.logger.info(f"\nFound {found_files}/{len(cwd_files)} CWD files")
-            
-            self.logger.info("\n--- Additional Status Checks ---")
-            # Try additional read-only commands
-            read_only_commands = [
-                ("PINFO  MEDIA", "Media type"),
-                ("PINFO  MEDIA_CLASS", "Media class"),
-                ("PINFO  PQTY", "Print quantity"),
-                ("PINFO  MQTY", "Media quantity"),
-                ("PINFO  FREE_PBUFFER", "Free buffer"),
-                ("PINFO  SENSOR", "Sensor status"),
-                ("PMNT_RDCOUNTER_LIFE", "Life counter"),
-                ("PMNT_RDUSB_ISERI_SET", "USB serial setting")
-            ]
-            
-            for cmd, desc in read_only_commands:
-                self.send_command(cmd)
-                time.sleep(0.1)
-                response = self.read_response()
-                if response:
-                    self.logger.info(f"{desc}: {response.decode('ascii', errors='ignore').strip()}")
-                    
-            self.logger.info("\n--- Dry Run Summary ---")
-            self.logger.info("✓ Printer communication successful")
-            self.logger.info("✓ All read-only commands executed")
-            self.logger.info("✓ No changes were made to the printer")
-            
-            # Check if update would be needed
-            self.logger.info("\n--- Update Recommendation ---")
-            self.logger.info("To perform actual firmware update, run without --dry-run flag")
-            self.logger.info("WARNING: Actual update will modify printer firmware!")
-            
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Dry run failed with error: {e}")
-            return False
-        finally:
-            # Release USB resources
-            if self.device:
-                usb.util.dispose_resources(self.device)
-            
-    def manage_cups(self, action='stop'):
-        """Stop or start CUPS service"""
-        if action == 'stop':
-            # Check if CUPS is running first
+        for res_id in ["300", "600", "610"]:
+            ver = self.query_command(f"PTBL_RDCWD{res_id}_Version  00000000")
+            chk = self.query_command(f"PTBL_RDCWD{res_id}_Checksum 00000000")
+            ver_s = ver.decode('ascii', errors='replace').strip() if ver else "N/A"
+            chk_s = chk.decode('ascii', errors='replace').strip() if chk else "N/A"
+            self.logger.info(f"  CWD{res_id}: version={ver_s}  checksum={chk_s}")
+
+        # Global CWD checksum
+        r = self.query_command("PMNT_RDCTRLD_CHKSUM    00000000")
+        if r:
+            self.logger.info(f"  Global CWD checksum: {r.decode('ascii', errors='replace').strip()}")
+
+    def get_life_counter(self):
+        r = self.query_command("PMNT_RDCOUNTER_LIFE")
+        if r:
+            self.logger.info(f"  Life counter: {r.decode('ascii', errors='replace').strip()}")
+
+    # ── Firmware update sequence ─────────────────────────────────────────
+    # Matches .NET updater: CvSetFirmwUpdateMode -> CvSetFirmwDataWrite -> waitUpdate
+
+    def get_status_code(self) -> int:
+        """Query PSTATUS and parse the integer status code.
+
+        CvGetStatus in cspstat64.dll returns parsed integer from status response.
+        Status codes: CVS_USUALLY_IDLE=0x10001, CVS_FLSHPROG_IDLE=0x100001, etc.
+        Returns CVSTATUS_ERROR (-0x80000000) on failure.
+        """
+        r = self.query_command("PSTATUS")
+        if r:
             try:
-                result = subprocess.run(['systemctl', 'is-active', 'cups'], 
-                                      capture_output=True, text=True)
-                if result.stdout.strip() == 'active':
+                # Status response is an integer formatted as string
+                status_str = r.decode('ascii', errors='replace').strip()
+                # Try parsing as decimal or hex
+                if status_str.startswith('0x') or status_str.startswith('0X'):
+                    return int(status_str, 16)
+                return int(status_str)
+            except ValueError:
+                self.logger.debug(f"  Could not parse status: {r!r}")
+                return CVSTATUS_ERROR
+        return CVSTATUS_ERROR
+
+    def enter_update_mode(self) -> bool:
+        """Step 1: PFW_UPDFLASH_REWRITE — put printer in flash rewrite mode.
+
+        From Form1.PRINTER_FW (line 3055):
+          CvSetFirmwUpdateMode(port)  → sends PFW_UPDFLASH_REWRITE
+          SleepDoEvent(4000)          → wait 4 seconds
+          Loop CvGetStatus(port) until == CVS_FLSHPROG_IDLE (0x100001)
+          Retry up to 30 times with 1s sleep between attempts.
+        """
+        self.logger.info("Entering firmware update mode (FLASH_REWRITE)...")
+        self.send_command("PFW_UPDFLASH_REWRITE")
+
+        self.logger.info(f"  Waiting {WAIT_CHMODE}s for mode change...")
+        time.sleep(WAIT_CHMODE)
+
+        # Poll status until CVS_FLSHPROG_IDLE
+        for attempt in range(MODE_RETRY_COUNT):
+            time.sleep(1.0)
+            status = self.get_status_code()
+            self.logger.debug(f"  Status poll {attempt + 1}/{MODE_RETRY_COUNT}: 0x{status & 0xFFFFFFFF:08x}")
+
+            if status == CVS_FLSHPROG_IDLE:
+                self.logger.info("Printer in flash program mode (FLSHPROG_IDLE)")
+                return True
+            if status == CVSTATUS_ERROR:
+                # cspstat64.dll returns CVSTATUS_ERROR for communication failures
+                # Keep retrying as per .NET updater logic
+                continue
+
+        self.logger.error(f"Failed to enter update mode after {MODE_RETRY_COUNT} attempts")
+        return False
+
+    def send_firmware(self) -> bool:
+        """Step 2: PFW_UPDFLASH_PROGRAM — send S-Record firmware data.
+
+        From Form1.PRINTER_FW (line 3082):
+          SetFirmwDataWrite(port, array, num)
+          → cspstat64.dll sends PFW_UPDFLASH_PROGRAM + 8-digit size + data + 4-byte LE size
+
+        Firmware data is padded to 32-byte boundary with zeros (Form1 line 3041-3049).
+        """
+        self.logger.info(f"Sending firmware: {self.firmware_path}")
+
+        with open(self.firmware_path, 'rb') as f:
+            firmware = f.read()
+
+        # Pad to 32-byte boundary with zeros (from Form1.PRINTER_FW line 3041)
+        pad = len(firmware) % 32
+        if pad != 0:
+            firmware += b'\x00' * pad
+            self.logger.debug(f"  Padded {pad} bytes to 32-byte boundary")
+
+        self.logger.info(f"  Size: {len(firmware)} bytes ({len(firmware) / 1024 / 1024:.1f} MB)")
+
+        self.send_data_command("PFW_UPDFLASH_PROGRAM", firmware, timeout=TIMEOUT_FLASH)
+        return True
+
+    def wait_for_flash(self) -> bool:
+        """Step 3: Poll CvGetStatus until printer returns to normal idle.
+
+        From Form1.PRINTER_FW (lines 3091-3146):
+          SleepDoEvent(15000)  → wait 15 seconds before first poll
+          Loop CvGetStatus(port) for up to 90 iterations × 2s = 3 minutes:
+            - CVS_USUALLY_IDLE (0x10001): success — printer rebooted to normal
+            - CVS_USUALLY_PAPER_END (0x10008): success (paper removed during update)
+            - CVS_USUALLY_RIBBON_END (0x10010): success (ribbon end)
+            - Status > 0x20001 and < 0x100001: setting/hardware error → fail
+            - Status > 0x100004: flash programming error → fail
+        """
+        self.logger.info(f"Waiting {WAIT_POST_TRANSFER}s for flash write to begin...")
+        time.sleep(WAIT_POST_TRANSFER)
+
+        self.logger.info(f"Polling status (up to {UPDATE_RETRY_COUNT} × {WAIT_POLL_INTERVAL}s)...")
+        for attempt in range(UPDATE_RETRY_COUNT):
+            time.sleep(WAIT_POLL_INTERVAL)
+            status = self.get_status_code()
+            s = status & 0xFFFFFFFF
+            self.logger.debug(f"  Poll {attempt + 1}/{UPDATE_RETRY_COUNT}: status=0x{s:08x}")
+
+            # Success conditions — printer returned to normal operation
+            if status in (CVS_USUALLY_IDLE, CVS_USUALLY_PAPER_END, CVS_USUALLY_RIBBON_END):
+                self.logger.info(f"Flash complete — printer idle (status=0x{s:08x})")
+                return True
+
+            # Error conditions from .NET updater
+            if status > 0x20001 and status < CVS_FLSHPROG_IDLE:
+                self.logger.error(f"Printer error during flash (status=0x{s:08x})")
+                return False
+            if status > CVS_FLSHPROG_FINISHED and status != CVSTATUS_ERROR:
+                self.logger.error(f"Flash programming error (status=0x{s:08x})")
+                return False
+
+        self.logger.error(f"Flash timed out after {UPDATE_RETRY_COUNT * WAIT_POLL_INTERVAL:.0f}s")
+        return False
+
+    def update_cwd_files(self) -> bool:
+        """Step 4: Update each CWD file — version first, then binary data, then verify.
+
+        From Module1.PRINTER_TBLW_ALL (line 96-170):
+          1. SetColorDataVersion(port, filename, len)  → PTBL_WTVersion + filename
+          2. SetColorDataWrite(port, cwd_bytes, len)    → PTBL_WTCTRLD_UPDATE_CW + data
+          3. GetCwdVersion(dpi, media) to verify         → PTBL_RDCWD{dpi}_Version
+          4. GetCwdCheckSum(dpi, media) to verify         → PTBL_RDCWD{dpi}_Checksum
+
+        CWD data padded to 4-byte boundary (Module1 line 123-134).
+        Order from Form1.cwdUpdate: SD first (media=1), then PD (media=2).
+        """
+        # (filename, expected_checksum, dpi_for_verify)
+        cwd_sequence = [
+            # SD (Standard Digital) — media=1
+            ("DS620_SD_300_0111.cwd", "28B7", "300"),
+            ("DS620_SD_600_0111.cwd", "FD22", "600"),
+            ("DS620_SD_610_0111.cwd", "5479", "610"),
+            # PD (Premium Digital) — media=2
+            ("DS620_PD_300_0111.cwd", "28B8", "300"),
+            ("DS620_PD_600_0111.cwd", "FD23", "600"),
+            ("DS620_PD_610_0111.cwd", "547A", "610"),
+        ]
+
+        for fname, expected_csum, dpi in cwd_sequence:
+            path = self.cwd_dir / fname
+            if not path.exists():
+                self.logger.error(f"  CWD file MISSING: {fname}")
+                return False
+
+            cwd_data = bytearray(path.read_bytes())
+
+            # Pad to 4-byte boundary with zeros (Module1.PRINTER_TBLW_ALL line 123-134)
+            pad = len(cwd_data) % 4
+            if pad != 0:
+                cwd_data += b'\x00' * (4 - pad)
+
+            self.logger.info(f"  Updating {fname} ({len(cwd_data)} bytes)...")
+
+            # Step 1: Set version (filename is the version string)
+            self.send_data_command("PTBL_WTVersion", fname.encode('ascii'))
+
+            # Step 2: Write CWD binary data
+            self.send_data_command("PTBL_WTCTRLD_UPDATE_CW", bytes(cwd_data))
+            time.sleep(1.0)
+
+            # Step 3: Verify version
+            ver = self.query_command(f"PTBL_RDCWD{dpi}_Version  00000000")
+            if ver:
+                ver_s = ver.decode('ascii', errors='replace').strip().upper()
+                if ver_s != fname.upper():
+                    self.logger.error(f"  Version mismatch: got {ver_s!r}, expected {fname.upper()!r}")
+                    return False
+                self.logger.info(f"    Version verified: {ver_s}")
+
+            # Step 4: Verify checksum
+            chk = self.query_command(f"PTBL_RDCWD{dpi}_Checksum 00000000")
+            if chk:
+                chk_s = chk.decode('ascii', errors='replace').strip().upper()
+                if chk_s != expected_csum.upper():
+                    self.logger.error(f"  Checksum mismatch: got {chk_s!r}, expected {expected_csum!r}")
+                    return False
+                self.logger.info(f"    Checksum verified: {chk_s}")
+
+        return True
+
+    def finalize_update(self):
+        """Step 5: Clear CWD tables and reset printer.
+
+        From Form1.cwdClear (line 2944): SetColorDataClear → PTBL_CL
+        Then PCNTRL PRINTER_RESET to reboot.
+        """
+        self.logger.info("Finalizing: clear CWD tables + reset...")
+        self.send_command("PTBL_CL                00000000")
+        time.sleep(0.5)
+        self.send_command("PCNTRL PRINTER_RESET")
+        time.sleep(2.0)
+        self.logger.info("Printer reset sent (LED should return to solid green)")
+
+    def verify_update(self) -> bool:
+        """Re-query firmware version after update."""
+        self.logger.info("Verifying firmware version...")
+        time.sleep(5.0)  # Wait for printer to fully restart
+
+        r = self.query_command("PTBL_RDVersion         00000000")
+        if r:
+            ver = r.decode('ascii', errors='replace').strip()
+            self.logger.info(f"  New firmware version: {ver}")
+            if "04.52" in ver or "0452" in ver:
+                self.logger.info("Firmware update VERIFIED OK!")
+                return True
+            self.logger.warning(f"  Version doesn't match expected 04.52")
+            return False
+
+        r = self.query_command("PINFO  FVER")
+        if r:
+            ver = r.decode('ascii', errors='replace').strip()
+            self.logger.info(f"  Firmware (PINFO): {ver}")
+            return "04.52" in ver or "0452" in ver
+
+        self.logger.error("Could not read firmware version after update")
+        return False
+
+    # ── CUPS management ──────────────────────────────────────────────────
+
+    def manage_cups(self, action: str = 'stop'):
+        if action == 'stop':
+            try:
+                r = subprocess.run(['systemctl', 'is-active', 'cups'], capture_output=True, text=True)
+                if r.stdout.strip() == 'active':
                     self.cups_was_running = True
-                    self.logger.info("Stopping CUPS service...")
-                    
-                    # Stop cups-browsed first if it exists
-                    subprocess.run(['sudo', 'systemctl', 'stop', 'cups-browsed'], 
-                                 capture_output=True)
-                    
-                    # Stop main CUPS service
-                    subprocess.run(['sudo', 'systemctl', 'stop', 'cups'], 
-                                 capture_output=True, check=True)
-                    
-                    self.logger.info("CUPS service stopped")
-                    time.sleep(2)  # Give time for USB to be released
-                else:
-                    self.logger.info("CUPS is not running")
+                    self.logger.info("Stopping CUPS...")
+                    subprocess.run(['sudo', 'systemctl', 'stop', 'cups-browsed'], capture_output=True)
+                    subprocess.run(['sudo', 'systemctl', 'stop', 'cups'], capture_output=True, check=True)
+                    self.logger.info("CUPS stopped")
+                    time.sleep(2)
             except Exception as e:
                 self.logger.warning(f"Could not stop CUPS: {e}")
-                
-    def run_update(self):
-        """Run the complete firmware update process"""
+
+    # ── Main entry points ────────────────────────────────────────────────
+
+    def dry_run(self) -> bool:
+        """Check printer status and versions without making any changes."""
+        self.logger.info("=== DRY RUN — no changes will be made ===")
         try:
-            # Stop CUPS to prevent interference
-            self.manage_cups('stop')
-            
-            # Find and setup printer
             if not self.find_printer():
                 return False
-                
             if not self.setup_usb():
                 return False
-                
-            # Get initial printer info
+
+            self.get_device_id()
             self.get_printer_info()
-            
-            # Confirm with user
-            print("\n" + "="*60)
+            self.check_cwd_versions()
+            self.get_life_counter()
+
+            self.logger.info("\n--- Firmware file ---")
+            if self.firmware_path.exists():
+                st = self.firmware_path.stat()
+                self.logger.info(f"  {self.firmware_path}: {st.st_size} bytes")
+                with open(self.firmware_path) as f:
+                    lines = f.readlines()
+                self.logger.info(f"  S-Record lines: {len(lines)}")
+            else:
+                self.logger.error(f"  NOT FOUND: {self.firmware_path}")
+
+            self.logger.info("\n--- CWD files ---")
+            for fname in ["DS620_PD_300_0111.cwd", "DS620_PD_600_0111.cwd", "DS620_PD_610_0111.cwd",
+                           "DS620_SD_300_0111.cwd", "DS620_SD_600_0111.cwd", "DS620_SD_610_0111.cwd"]:
+                p = self.cwd_dir / fname
+                if p.exists():
+                    self.logger.info(f"  OK  {fname} ({p.stat().st_size} bytes)")
+                else:
+                    self.logger.warning(f"  MISSING  {fname}")
+
+            self.logger.info("\n--- Additional status ---")
+            for cmd, label in [
+                ("PINFO  SENSOR",         "Sensor"),
+                ("PINFO  MEDIA_CLASS_RFID", "Media RFID"),
+                ("PMNT_RDUSB_ISERI_SET",  "USB serial setting"),
+            ]:
+                r = self.query_command(cmd)
+                if r:
+                    self.logger.info(f"  {label}: {r.decode('ascii', errors='replace').strip()}")
+
+            self.logger.info("\nDry run complete. Run without --dry-run to perform actual update.")
+            return True
+        except Exception as e:
+            self.logger.error(f"Dry run failed: {e}")
+            return False
+        finally:
+            if self.device:
+                usb.util.dispose_resources(self.device)
+
+    def run_update(self) -> bool:
+        """Execute the full firmware update sequence."""
+        try:
+            self.manage_cups('stop')
+
+            if not self.find_printer():
+                return False
+            if not self.setup_usb():
+                return False
+
+            self.get_device_id()
+            self.get_printer_info()
+            self.check_cwd_versions()
+
+            print("\n" + "=" * 60)
             print("WARNING: Firmware update will begin.")
             print("DO NOT disconnect USB or power during the update!")
-            print("The printer may be permanently damaged if interrupted.")
-            print("")
-            print("CUPS has been stopped to prevent interference.")
-            print("It will be restarted after the update.")
-            print("="*60 + "\n")
-            
-            response = input("Continue with firmware update? (yes/no): ")
-            if response.lower() != 'yes':
-                self.logger.info("Update cancelled by user")
+            print("=" * 60 + "\n")
+
+            if input("Continue? (yes/no): ").strip().lower() != 'yes':
+                self.logger.info("Cancelled by user")
                 return False
-            
-            # Mark update as in progress
+
             self.update_in_progress = True
-            self.logger.info("Starting firmware update...")
-            update_start = time.time()
-                
-            # Check current firmware version and CWD versions
-            self.check_cwd_versions()
-            
-            # Check printer status before update
-            self.logger.info("Checking printer status before update...")
-            self.send_command("PSTATUS")
-            time.sleep(0.5)
-            status_response = self.read_response()
-            if status_response:
-                self.logger.info(f"Printer status: {status_response.decode('ascii', errors='replace').strip()}")
-            
-            # Enter update mode
+            t0 = time.time()
+
+            # Step 1: Enter flash rewrite mode
             if not self.enter_update_mode():
                 return False
-                
-            # Send firmware
+
+            # Step 2: Send firmware via PFW_UPDFLASH_PROGRAM
             if not self.send_firmware():
                 return False
-                
-            # Program flash
-            if not self.program_flash():
+
+            # Step 3: Wait for flash programming to complete
+            if not self.wait_for_flash():
                 return False
-                
-            # Update CWD files
-            self.update_cwd_files()
-            
-            # Reset printer
-            self.reset_printer()
-            
-            # Mark update as complete
+
+            # Step 4: Clear old CWD and update all CWD files
+            # From Form1.btnStart_Click: cwdClear() then cwdUpdate()
+            self.send_command("PTBL_CL                00000000")  # cwdClear
+            time.sleep(0.5)
+
+            if not self.update_cwd_files():
+                self.logger.error("CWD update failed")
+                return False
+
+            # Step 5: Finalize and reset
+            self.finalize_update()
+
             self.update_in_progress = False
-            update_time = time.time() - update_start
-            
-            # Verify update
+            elapsed = time.time() - t0
+
+            # Verify
             if self.verify_update():
-                self.logger.info(f"Firmware update completed successfully in {update_time:.1f} seconds!")
-                print("\nIMPORTANT: Please reload paper and perform 'Paper Initialization'")
-                print("\nTo restore printer in CUPS, run: ./recover_printer.sh")
+                self.logger.info(f"Firmware update completed in {elapsed:.0f}s!")
+                print("\nIMPORTANT: Reload paper and perform 'Paper Initialization'")
                 return True
-            else:
-                self.logger.error("Firmware update may have failed")
-                return False
-                
+
+            self.logger.error("Firmware verification failed")
+            return False
+
         except Exception as e:
-            self.logger.error(f"Update failed with error: {e}")
+            self.logger.error(f"Update failed: {e}")
             self.update_in_progress = False
             return False
         finally:
-            # Cleanup will handle USB resources and CUPS restart
             self.cleanup()
-                
+
+
 def main():
     parser = argparse.ArgumentParser(description='DS620A Firmware Updater for Linux')
     parser.add_argument('--firmware', '-f', required=True, help='Path to DS620_0452.s firmware file')
     parser.add_argument('--cwd-dir', '-c', required=True, help='Directory containing CWD files')
     parser.add_argument('--debug', '-d', action='store_true', help='Enable debug logging')
-    parser.add_argument('--dry-run', '-n', action='store_true', help='Perform dry run - check versions without updating')
-    parser.add_argument('--log-file', '-l', help='Log all output to specified file')
-    parser.add_argument('--no-cups', action='store_true', help='Do not automatically stop/start CUPS')
-    
+    parser.add_argument('--dry-run', '-n', action='store_true', help='Check versions without updating')
+    parser.add_argument('--log-file', '-l', help='Log output to file')
+    parser.add_argument('--no-cups', action='store_true', help='Do not auto-manage CUPS')
+
     args = parser.parse_args()
-    
+
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
-        
-    # Validate paths
+
     firmware_path = Path(args.firmware)
     cwd_dir = Path(args.cwd_dir)
-    
+
     if not firmware_path.exists():
         print(f"Error: Firmware file not found: {firmware_path}")
         sys.exit(1)
-        
     if not cwd_dir.is_dir():
         print(f"Error: CWD directory not found: {cwd_dir}")
         sys.exit(1)
-        
-    # Create log file with timestamp if requested
+
     log_file = None
     if args.log_file:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_file = f"{args.log_file}_{timestamp}.log"
-        
-    # Create updater
-    updater = DS620Updater(firmware_path, cwd_dir, log_file)
-    
-    # Check if running as root for actual updates
+        log_file = f"{args.log_file}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+    updater = DS620Updater(str(firmware_path), str(cwd_dir), log_file)
+
     if not args.dry_run and os.geteuid() != 0:
-        print("WARNING: Not running as root. You may encounter permission issues.")
-        print("Consider running with sudo for actual firmware updates.")
-        print("")
-    
-    # Run dry-run or actual update
+        print("WARNING: Not running as root — may encounter permission errors.")
+        print("Consider: sudo ...\n")
+
     if args.dry_run:
-        success = updater.dry_run()
+        ok = updater.dry_run()
     else:
         if args.no_cups:
-            updater.cups_was_running = False  # Disable automatic CUPS management
-        success = updater.run_update()
-    
-    sys.exit(0 if success else 1)
-    
+            updater.cups_was_running = False
+        ok = updater.run_update()
+
+    sys.exit(0 if ok else 1)
+
+
 if __name__ == "__main__":
     main()
