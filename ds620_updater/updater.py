@@ -355,7 +355,8 @@ class DS620Updater:
         self.ep_out.write(trailer)
 
         elapsed = time.time() - t0
-        self.logger.info(f"  Sent {len(data)} bytes in {elapsed:.1f}s ({len(data) / elapsed / 1024:.0f} KB/s)")
+        rate = f"{len(data) / elapsed / 1024:.0f} KB/s" if elapsed > 0 else "instant"
+        self.logger.info(f"  Sent {len(data)} bytes in {elapsed:.1f}s ({rate})")
 
         # Read optional response
         try:
@@ -504,8 +505,9 @@ class DS620Updater:
             firmware = f.read()
 
         # Pad to 32-byte boundary with zeros (from Form1.PRINTER_FW line 3041)
-        pad = len(firmware) % 32
-        if pad != 0:
+        remainder = len(firmware) % 32
+        if remainder != 0:
+            pad = 32 - remainder
             firmware += b'\x00' * pad
             self.logger.debug(f"  Padded {pad} bytes to 32-byte boundary")
 
