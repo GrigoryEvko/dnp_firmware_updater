@@ -60,3 +60,6 @@ docs/_templates/
 # Local configuration
 .env
 .env.local
+
+# Internal fleet ops runbook (keep out of the public repo)
+FLEET_UPDATE.md
